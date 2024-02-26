@@ -135,6 +135,9 @@ class AutoRebalancerTask {
   // to have them moved in order to rebalance the cluster.
   // Returns a non-OK status if the replica or the replica's tserver
   // cannot be found, or the request to move the replica cannot be completed.
+  //
+  // Some information that is used to removing the replace flag if the moves
+  // fail lately will be added to the ReplicaMoves in this method.
   Status ExecuteMoves(
       const std::vector<rebalance::Rebalancer::ReplicaMove>& replica_moves);
 
