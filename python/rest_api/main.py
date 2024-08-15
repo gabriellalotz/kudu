@@ -4,22 +4,29 @@ from fastapi import FastAPI, Query
 from fastapi.responses import RedirectResponse
 from utils import schema_to_dict, column_names
 from kudu.client import Partitioning
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+from pydantic.fields import Field
 from typing import List, Union
 from typing_extensions import Annotated
 from fastapi.exceptions import HTTPException
 
 # Define the schemas for the API.
 
-    # def add_column(self, name, type_=None, nullable=None, compression=None, encoding=None,
-    #                primary_key=False, non_unique_primary_key=False, block_size=None, default=None,
-    #                precision=None, scale=None, length=None, comment=None):
+
 class Column(BaseModel):
-    # TODO: add more data
     name: str
-    type: str 
-    nullable: bool
-    primary_key: bool
+    type: str = Field(default='None', description="The type of the column")
+    nullable: bool = Field(default='None')
+    compression: str = Field(default='None', description="One of {'default', 'none', 'snappy', 'lz4', 'zlib'}")
+    encoding: str = Field(default='None', description="One of {'auto', 'plain', 'prefix', 'bitshuffle', 'rle', 'dict'}")
+    primary_key: bool = Field(default=False)
+    non_unique_primary_key: bool = Field(default=False)
+    block_size: int = Field(default='None')
+    default: object = Field(default='None')
+    precision: int = Field(default='None')
+    scale: int = Field(default='None')
+    length: int = Field(default='None')
+    comment: str = Field(default='')
 
 
 class Schema(BaseModel):
