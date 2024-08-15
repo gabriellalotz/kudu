@@ -4,17 +4,20 @@ from fastapi import FastAPI, Query
 from fastapi.responses import RedirectResponse
 from utils import schema_to_dict, column_names
 from kudu.client import Partitioning
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Union
 from typing_extensions import Annotated
 from fastapi.exceptions import HTTPException
 
 # Define the schemas for the API.
 
-
+    # def add_column(self, name, type_=None, nullable=None, compression=None, encoding=None,
+    #                primary_key=False, non_unique_primary_key=False, block_size=None, default=None,
+    #                precision=None, scale=None, length=None, comment=None):
 class Column(BaseModel):
+    # TODO: add more data
     name: str
-    type: str
+    type: str 
     nullable: bool
     primary_key: bool
 
@@ -75,7 +78,6 @@ def get_table(table: str):
 
 @app.post("/tables", status_code=201)
 def post_table(name: str, table_schema: Schema, hash_partitioning: HashPartition):
-    # Define a schema for a new table.
     builder = kudu.schema_builder()
     for column in table_schema.columns:
         if column.primary_key:
@@ -85,7 +87,7 @@ def post_table(name: str, table_schema: Schema, hash_partitioning: HashPartition
             builder.add_column(column.name).type(
                 column.type).nullable(column.nullable)
     schema = builder.build()
-    # Define the partitioning schema.
+
     partitioning = Partitioning()
     # TODO: put default values in schemas
     if hash_partitioning:
@@ -94,13 +96,11 @@ def post_table(name: str, table_schema: Schema, hash_partitioning: HashPartition
     # if range_partitioning:
     #     partitioning.add_range_partition(lower_bound=range_partitioning.lower_bound, upper_bound=range_partitioning.upper_bound,
     #                                      lower_bound_type=range_partitioning.lower_bound_type, upper_bound_type=range_partitioning.upper_bound_type)
-    # Throw error if table already exists.
+
     if client.table_exists(name):
         raise HTTPException(status_code=409, detail="Table already exists.")
-    # Create a new table
     client.create_table(name, schema, partitioning)
     table = client.table(name)
-    # Return the table
     return schema_to_dict(table)
 
 # DELETE api/v1/tables/{table} - drop table
@@ -117,30 +117,30 @@ def delete_table(table: str):
 @app.put("/tables/{table}")
 def put_table(table: str, new_table_name: Union[str, None] = None, table_schema: Schema = None):
     table = client.table(table)
+    
     if new_table_name:
         if client.table_exists(new_table_name):
             raise HTTPException(
                 status_code=409, detail="Table already exists.")
-        # rename table
         alterer = client.new_table_alterer(table)
         table = alterer.rename(new_table_name).alter()
+        
     if len(column_names(table.schema)) < len(table_schema.columns):
-        # add new column
         alterer = client.new_table_alterer(table)
         for column in table_schema.columns:
             if column.name not in column_names(table.schema):
                 alterer.add_column(column.name).type(column.type).nullable(
                     column.nullable)
                 table = alterer.alter()
+                
     elif len(column_names(table.schema)) > len(table_schema.columns):
-        # remove column
         alterer = client.new_table_alterer(table)
         for column_name in column_names(table.schema):
             if column_name not in [column.name for column in table_schema.columns]:
                 alterer.drop_column(column_name)
                 table = alterer.alter()
+                
     else:
-        # modify column
         alterer = client.new_table_alterer(table)
         for i, column in enumerate(table_schema.columns):
             if column.name not in column_names(table.schema):
@@ -150,6 +150,7 @@ def put_table(table: str, new_table_name: Union[str, None] = None, table_schema:
     # partition check
     return schema_to_dict(table)
 
+# rename table
 # GET api/v1/tables/{table}/partitions - list partitions
 # GET api/v1/tables/{table}/tablets - list tablets
 
