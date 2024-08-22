@@ -1,76 +1,23 @@
 import uvicorn
 import kudu
-from fastapi import FastAPI, Query
+import argparse
+from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
 from utils import schema_to_dict, column_names
 from kudu.client import Partitioning
-from pydantic import BaseModel
-from pydantic.fields import Field
-from typing import List, Union, Optional
-from typing_extensions import Annotated
 from fastapi.exceptions import HTTPException
-
-# Define the schemas for the API.
-
-
-class Column(BaseModel):
-    name: str
-    type: str = Field(default='', description='The type of the column')
-    # originally bool but default is None
-    nullable: Optional[bool] = Field(default=None)
-    # compression: str = Field(default='None', 
-    #   description='One of {'default', 'none', 'snappy', 'lz4', 'zlib'}')
-    # encoding: str = Field(default='None', 
-    #   description='One of {'auto', 'plain', 'prefix', 'bitshuffle', 'rle', 'dict'}')
-    primary_key: bool = Field(default=False)
-    # non_unique_primary_key: bool = Field(default=False)
-    # block_size: int = Field(default='None')
-    # default: object = Field(default='None')
-    # The precision must be between 1 and 38.
-    precision: Optional[int] = Field(default=None)
-    scale: Optional[int] = Field(default=None)
-    # The length must be between 1 and 65,535 (inclusive).
-    length: Optional[int] = Field(default=None)
-    comment: str = Field(default='')
-
-
-class Schema(BaseModel):
-    columns: List[Column]
-
-
-class Table(BaseModel):
-    name: str
-    table_schema: Schema
-
-
-class HashPartition(BaseModel):
-    column_names: List[str] = Field()
-    num_buckets: int = Field(default=0)
-    seed: str = Field(default='None')
-
-
-class RangePartition(BaseModel):
-    # PartialRow/list/tuple/dict
-    lower_bound: dict = Field()
-    # PartialRow/list/tuple/dict
-    upper_bound: dict = Field()
-    # {'inclusive', 'exclusive'} or constants
-    lower_bound_type: str = Field(default='inclusive')
-    # {'inclusive', 'exclusive'} or constants
-    upper_bound_type: str = Field(default='exclusive')
-
-
-class RangePartitionSplit(BaseModel):
-    split_row: List[Union[int, float, str]]
-
-
-class TablesResponse(BaseModel):
-    tables: List[str]
+from schemas import Schema, HashPartition, RangePartitionColumns, RangePartition, TablesResponse
 
 
 app = FastAPI(root_path='/api/v1')
-client = kudu.connect(host='localhost', port=8764)
+parser = argparse.ArgumentParser(description='REST API for Kudu.')
+parser.add_argument('--masters', '-m', nargs='+', default='localhost',
+                    help='The master address(es) to connect to Kudu.')
+parser.add_argument('--ports', '-p', nargs='+', default='7051',
+                    help='The master server port(s) to connect to Kudu.')
+args = parser.parse_args()
 
+client = kudu.connect(host=args.masters, port=args.ports)
 
 @app.get('/')
 def read_root():
@@ -94,44 +41,52 @@ def get_table(table: str):
     return table_dict
 
 # POST api/v1/tables - create new table
-# TODO: try out different examples, query parameters could be in different formats
 
 
 @app.post('/tables', status_code=201)
-def post_table(name: str, table_schema: Schema, hash_partitioning: HashPartition, range_partitioning: RangePartition):
+def post_table(name: str, table_schema: Schema, hash_partitioning: HashPartition, range_partition_columns: RangePartitionColumns, range_partitioning: RangePartition):
     builder = kudu.schema_builder()
     for column in table_schema.columns:
-        if column.primary_key:
-            (builder
-             .add_column(column.name)
-             .type(column.type)
-             .nullable(column.nullable)
-             .primary_key())
-        else:
-            (builder
-             .add_column(column.name)
-             .type(column.type)
-             .nullable(column.nullable))
-        if column.precision:
-            builder.precision(column.precision)
-        if column.scale:
-            builder.scale(column.scale)
-        if column.length:
-            builder.length(column.length)
-
-    schema = builder.build()
+            if column.primary_key:
+                (builder
+                 .add_column(column.name)
+                 .type(column.type)
+                 .nullable(column.nullable)
+                 .primary_key())
+            else:
+                (builder
+                 .add_column(column.name)
+                 .type(column.type)
+                 .nullable(column.nullable))
+            if column.precision:
+                builder.precision(column.precision)
+            if column.scale:
+                builder.scale(column.scale)
+            if column.length:
+                builder.length(column.length)
+            if column.comment:
+                builder.comment(column.comment)
+    try:
+        schema = builder.build()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     partitioning = Partitioning()
-    if hash_partitioning:
+    if len(hash_partitioning.column_names) > 0:
         partitioning.add_hash_partitions(
             column_names=hash_partitioning.column_names, num_buckets=hash_partitioning.num_buckets)
-    # if range_partitioning:
-    #     partitioning.add_range_partition(lower_bound=range_partitioning.lower_bound, upper_bound=range_partitioning.upper_bound,
-    #                                      lower_bound_type=range_partitioning.lower_bound_type, upper_bound_type=range_partitioning.upper_bound_type)
+    if len(range_partition_columns.columns) > 0:
+        partitioning.set_range_partition_columns(
+            range_partition_columns.columns)
+        partitioning.add_range_partition(lower_bound=range_partitioning.lower_bound, upper_bound=range_partitioning.upper_bound,
+                                         lower_bound_type=range_partitioning.lower_bound_type, upper_bound_type=range_partitioning.upper_bound_type)
 
     if client.table_exists(name):
         raise HTTPException(status_code=409, detail='Table already exists.')
-    client.create_table(name, schema, partitioning)
+    try:
+        client.create_table(name, schema, partitioning)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
     table = client.table(name)
     return schema_to_dict(table)
 
@@ -140,6 +95,8 @@ def post_table(name: str, table_schema: Schema, hash_partitioning: HashPartition
 
 @app.delete('/tables/{table}', status_code=204)
 def delete_table(table: str):
+    if not client.table_exists(table):
+        raise HTTPException(status_code=404, detail='Table does not exist.')
     client.delete_table(table)
     return
 
@@ -154,9 +111,12 @@ def put_table(table: str, table_schema: Schema = None):
         alterer = client.new_table_alterer(table)
         for column in table_schema.columns:
             if column.name not in column_names(table.schema):
-                # name, type, nullable, complession, encoding, default
-                alterer.add_column(column.name).type(column.type).nullable(
+                # name, type, nullable, compression, encoding, default
+                try:
+                    alterer.add_column(column.name).type(column.type).nullable(
                     column.nullable)
+                except Exception as e:
+                    raise HTTPException(status_code=400, detail=str(e))
                 table = alterer.alter()
 
     elif len(column_names(table.schema)) > len(table_schema.columns):
