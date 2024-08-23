@@ -19,6 +19,7 @@ args = parser.parse_args()
 
 client = kudu.connect(host=args.masters, port=args.ports)
 
+
 @app.get('/')
 def read_root():
     return RedirectResponse(url='/docs')
@@ -36,6 +37,8 @@ def get_tables() -> TablesResponse:
 
 @app.get('/tables/{table}')
 def get_table(table: str):
+    if not client.table_exists(table):
+        raise HTTPException(status_code=404, detail='Table does not exist.')
     table = client.table(table)
     table_dict = schema_to_dict(table)
     return table_dict
@@ -44,28 +47,29 @@ def get_table(table: str):
 
 
 @app.post('/tables', status_code=201)
-def post_table(name: str, table_schema: Schema, hash_partitioning: HashPartition, range_partition_columns: RangePartitionColumns, range_partitioning: RangePartition):
+def post_table(name: str, table_schema: Schema, hash_partitioning: HashPartition, 
+               range_partition_columns: RangePartitionColumns, range_partitioning: RangePartition):
     builder = kudu.schema_builder()
     for column in table_schema.columns:
-            if column.primary_key:
-                (builder
-                 .add_column(column.name)
-                 .type(column.type)
-                 .nullable(column.nullable)
-                 .primary_key())
-            else:
-                (builder
-                 .add_column(column.name)
-                 .type(column.type)
-                 .nullable(column.nullable))
-            if column.precision:
-                builder.precision(column.precision)
-            if column.scale:
-                builder.scale(column.scale)
-            if column.length:
-                builder.length(column.length)
-            if column.comment:
-                builder.comment(column.comment)
+        if column.primary_key:
+            (builder
+             .add_column(column.name)
+             .type(column.type)
+             .nullable(column.nullable)
+             .primary_key())
+        else:
+            (builder
+             .add_column(column.name)
+             .type(column.type)
+             .nullable(column.nullable))
+        if column.precision:
+            builder.precision(column.precision)
+        if column.scale:
+            builder.scale(column.scale)
+        if column.length:
+            builder.length(column.length)
+        if column.comment:
+            builder.comment(column.comment)
     try:
         schema = builder.build()
     except Exception as e:
@@ -78,8 +82,10 @@ def post_table(name: str, table_schema: Schema, hash_partitioning: HashPartition
     if len(range_partition_columns.columns) > 0:
         partitioning.set_range_partition_columns(
             range_partition_columns.columns)
-        partitioning.add_range_partition(lower_bound=range_partitioning.lower_bound, upper_bound=range_partitioning.upper_bound,
-                                         lower_bound_type=range_partitioning.lower_bound_type, upper_bound_type=range_partitioning.upper_bound_type)
+        partitioning.add_range_partition(lower_bound=range_partitioning.lower_bound, 
+                                         upper_bound=range_partitioning.upper_bound,
+                                         lower_bound_type=range_partitioning.lower_bound_type, 
+                                         upper_bound_type=range_partitioning.upper_bound_type)
 
     if client.table_exists(name):
         raise HTTPException(status_code=409, detail='Table already exists.')
@@ -114,7 +120,7 @@ def put_table(table: str, table_schema: Schema = None):
                 # name, type, nullable, compression, encoding, default
                 try:
                     alterer.add_column(column.name).type(column.type).nullable(
-                    column.nullable)
+                        column.nullable)
                 except Exception as e:
                     raise HTTPException(status_code=400, detail=str(e))
                 table = alterer.alter()
