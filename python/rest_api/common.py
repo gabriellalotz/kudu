@@ -24,6 +24,8 @@ import subprocess
 
 import kudu
 from kudu.client import Partitioning
+from fastapi.testclient import TestClient
+from .app.main import app
 
 # There's no built-in timeout error in Python 2.
 # See https://stackoverflow.com/questions/2281850.
@@ -119,30 +121,17 @@ class KuduTestBase(object):
         return p, master_hosts, master_ports, master_http_hostports
 
     @classmethod
-    def start_rest_service(cls):
-        args = ["python3.8", "../main.py", "--masters", cls.master_hosts, "--ports", cls.master_ports]
-        proc = subprocess.Popen(args, shell=False, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-        return proc
-
-    @classmethod
     def stop_cluster(cls):
         cls.cluster_proc.stdin.close()
         ret = cls.cluster_proc.wait()
         if ret != 0:
             raise Exception("Minicluster process exited with code {0}".format(ret))
-        
-    @classmethod
-    def stop_rest_service(cls):
-        cls.rest_proc.stdin.close()
-        ret = cls.rest_proc.wait()
-        if ret != 0:
-            raise Exception("REST service process exited with code {0}".format(ret))
 
     @classmethod
     def setUpClass(cls):
         cls.cluster_proc, cls.master_hosts, cls.master_ports, \
                 cls.master_http_hostports = cls.start_cluster() 
-        cls.rest_proc = cls.start_rest_service()
+        cls.rest_api_client = TestClient(app)
 
         cls.client = kudu.connect(cls.master_hosts, cls.master_ports)
 
@@ -157,7 +146,6 @@ class KuduTestBase(object):
     @classmethod
     def tearDownClass(cls):
         cls.stop_cluster()
-        cls.stop_rest_service()
 
     @classmethod
     def example_schema(cls):

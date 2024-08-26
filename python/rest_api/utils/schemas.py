@@ -31,6 +31,9 @@ class Schema(BaseModel):
 class Table(BaseModel):
     name: str
     table_schema: Schema
+    hash_partitioning: Optional['HashPartition'] = Field(default=None)
+    range_partition_columns: Optional['RangePartitionColumns'] = Field(default=None)
+    range_partitioning: Optional['RangePartition'] = Field(default=None)
 
 
 class HashPartition(BaseModel):
