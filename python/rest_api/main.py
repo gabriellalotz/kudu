@@ -3,22 +3,14 @@ import kudu
 import argparse
 from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
-from utils.utils import table_to_dict, column_names
+from utils import table_to_dict, column_names # for tests to work import should be python.rest_api.utils
 from kudu.client import Partitioning
 from fastapi.exceptions import HTTPException
-from utils.schemas import Schema, HashPartition, RangePartitionColumns, RangePartition, TablesResponse, Table
+from schemas import TablesResponse, Table # for tests to work import should be python.rest_api.schemas
 
 
 app = FastAPI(root_path='/api/v1')
-parser = argparse.ArgumentParser(description='REST API for Kudu.')
-parser.add_argument('--masters', '-m', nargs='+', default='localhost',
-                    help='The master address(es) to connect to Kudu.')
-parser.add_argument('--ports', '-p', nargs='+', default='7051',
-                    help='The master server port(s) to connect to Kudu.')
-args = parser.parse_args()
-
-client = kudu.connect(host=args.masters, port=args.ports)
-
+app.client = None
 
 @app.get('/')
 def read_root():
@@ -29,7 +21,7 @@ def read_root():
 
 @app.get('/tables')
 def get_tables() -> TablesResponse:
-    tables = client.list_tables()
+    tables = app.client.list_tables()
     return {'tables': tables}
 
 # GET api/v1/tables/{table} - load table
@@ -37,9 +29,9 @@ def get_tables() -> TablesResponse:
 
 @app.get('/tables/{table}')
 def get_table(table_name: str) -> Table:
-    if not client.table_exists(table_name):
+    if not app.client.table_exists(table_name):
         raise HTTPException(status_code=404, detail='Table does not exist.')
-    table_name = client.table(table_name)
+    table_name = app.client.table(table_name)
     table_dict = table_to_dict(table_name)
     return table_dict
 
@@ -86,13 +78,13 @@ def post_table(table: Table) -> Table:
                                          lower_bound_type=table.range_partitioning.lower_bound_type,
                                          upper_bound_type=table.range_partitioning.upper_bound_type)
 
-    if client.table_exists(table.name):
+    if app.client.table_exists(table.name):
         raise HTTPException(status_code=409, detail='Table already exists.')
     try:
-        client.create_table(table.name, schema, partitioning)
+        app.client.create_table(table.name, schema, partitioning)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-    table = client.table(table.name)
+    table = app.client.table(table.name)
     return table_to_dict(table)
 
 # DELETE api/v1/tables/{table} - drop table
@@ -100,9 +92,9 @@ def post_table(table: Table) -> Table:
 
 @app.delete('/tables/{table}', status_code=204)
 def delete_table(table_name: str):
-    if not client.table_exists(table_name):
+    if not app.client.table_exists(table_name):
         raise HTTPException(status_code=404, detail='Table does not exist.')
-    client.delete_table(table_name)
+    app.client.delete_table(table_name)
     return
 
 # PUT api/v1/tables/{table} - update table
@@ -110,11 +102,10 @@ def delete_table(table_name: str):
 
 @app.put('/tables/{table.name}')
 def put_table(table: Table) -> Table:
-    original_table = client.table(table.name)
-    # table_schema - input
-    # table - original table
+    original_table = app.client.table(table.name)
+
     if len(column_names(original_table.schema)) < len(table.table_schema.columns):
-        alterer = client.new_table_alterer(original_table)
+        alterer = app.client.new_table_alterer(original_table)
         for column in table.table_schema.columns:
             if column.name not in column_names(original_table.schema):
                 # name, type, nullable, compression, encoding, default
@@ -126,14 +117,14 @@ def put_table(table: Table) -> Table:
                 original_table = alterer.alter()
 
     elif len(column_names(original_table.schema)) > len(table.table_schema.columns):
-        alterer = client.new_table_alterer(original_table)
+        alterer = app.client.new_table_alterer(original_table)
         for column_name in column_names(original_table.schema):
             if column_name not in [column.name for column in table.table_schema.columns]:
                 alterer.drop_column(column_name)
                 original_table = alterer.alter()
 
     else:
-        alterer = client.new_table_alterer(original_table)
+        alterer = app.client.new_table_alterer(original_table)
         for i, column in enumerate(table.table_schema.columns):
             if column.name not in column_names(original_table.schema):
                 alterer.alter_column(original_table.schema.at(
@@ -147,15 +138,26 @@ def put_table(table: Table) -> Table:
 
 @app.put('/tables/{table_name}/rename')
 def put_table_rename(table_name: str, new_table_name: str):
-    table_name = client.table(table_name)
-    if client.table_exists(new_table_name):
+    table_name = app.client.table(table_name)
+    if app.client.table_exists(new_table_name):
         raise HTTPException(status_code=409, detail='Table already exists.')
-    alterer = client.new_table_alterer(table_name)
+    alterer = app.client.new_table_alterer(table_name)
     table_name = alterer.rename(new_table_name).alter()
     return table_to_dict(table_name)
 
 # GET api/v1/tables/{table}/tablets - list tablets
 
 
-if __name__ == '__main__':
+def main():
+    parser = argparse.ArgumentParser(description='REST API for Kudu.')
+    parser.add_argument('--masters', '-m', nargs='+', default='localhost',
+                        help='The master address(es) to connect to Kudu.')
+    parser.add_argument('--ports', '-p', nargs='+', default='7051',
+                        help='The master server port(s) to connect to Kudu.')
+    args = parser.parse_args()
+    app.client = kudu.connect(host=args.masters, port=args.ports)
     uvicorn.run('main:app', reload=True)
+
+
+if __name__ == '__main__':
+    main()

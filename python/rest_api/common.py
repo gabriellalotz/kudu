@@ -25,7 +25,7 @@ import subprocess
 import kudu
 from kudu.client import Partitioning
 from fastapi.testclient import TestClient
-from .app.main import app
+from .main import app
 
 # There's no built-in timeout error in Python 2.
 # See https://stackoverflow.com/questions/2281850.
@@ -134,6 +134,7 @@ class KuduTestBase(object):
         cls.rest_api_client = TestClient(app)
 
         cls.client = kudu.connect(cls.master_hosts, cls.master_ports)
+        app.client = cls.client
 
         cls.schema = cls.example_schema()
         cls.partitioning = cls.example_partitioning()
