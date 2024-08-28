@@ -25,7 +25,7 @@ import subprocess
 import kudu
 from kudu.client import Partitioning
 from fastapi.testclient import TestClient
-from .main import app
+from main import app
 
 # There's no built-in timeout error in Python 2.
 # See https://stackoverflow.com/questions/2281850.

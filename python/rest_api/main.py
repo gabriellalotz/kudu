@@ -3,14 +3,20 @@ import kudu
 import argparse
 from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
-from utils import table_to_dict, column_names # for tests to work import should be python.rest_api.utils
+from utils import table_to_dict, column_names 
 from kudu.client import Partitioning
 from fastapi.exceptions import HTTPException
-from schemas import TablesResponse, Table # for tests to work import should be python.rest_api.schemas
+from schemas import TablesResponse, Table 
 
 
 app = FastAPI(root_path='/api/v1')
-app.client = None
+parser = argparse.ArgumentParser(description='REST API for Kudu.')
+parser.add_argument('--masters', '-m', nargs='+', default='localhost',
+                    help='The master address(es) to connect to Kudu.')
+parser.add_argument('--ports', '-p', nargs='+', default='7051',
+                    help='The master server port(s) to connect to Kudu.')
+args = parser.parse_args()
+app.client = kudu.connect(host=args.masters, port=args.ports)
 
 @app.get('/')
 def read_root():
@@ -27,7 +33,7 @@ def get_tables() -> TablesResponse:
 # GET api/v1/tables/{table} - load table
 
 
-@app.get('/tables/{table}')
+@app.get('/tables/{table_name}')
 def get_table(table_name: str) -> Table:
     if not app.client.table_exists(table_name):
         raise HTTPException(status_code=404, detail='Table does not exist.')
@@ -90,7 +96,7 @@ def post_table(table: Table) -> Table:
 # DELETE api/v1/tables/{table} - drop table
 
 
-@app.delete('/tables/{table}', status_code=204)
+@app.delete('/tables/{table_name}', status_code=204)
 def delete_table(table_name: str):
     if not app.client.table_exists(table_name):
         raise HTTPException(status_code=404, detail='Table does not exist.')
@@ -149,15 +155,7 @@ def put_table_rename(table_name: str, new_table_name: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='REST API for Kudu.')
-    parser.add_argument('--masters', '-m', nargs='+', default='localhost',
-                        help='The master address(es) to connect to Kudu.')
-    parser.add_argument('--ports', '-p', nargs='+', default='7051',
-                        help='The master server port(s) to connect to Kudu.')
-    args = parser.parse_args()
-    app.client = kudu.connect(host=args.masters, port=args.ports)
     uvicorn.run('main:app', reload=True)
-
 
 if __name__ == '__main__':
     main()
