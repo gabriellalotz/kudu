@@ -3,20 +3,26 @@ import kudu
 import argparse
 from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
-from utils import table_to_dict, column_names 
+from utils import table_to_dict, column_names
 from kudu.client import Partitioning
 from fastapi.exceptions import HTTPException
-from schemas import TablesResponse, Table 
+from schemas import TablesResponse, Table
 
 
 app = FastAPI(root_path='/api/v1')
+
 parser = argparse.ArgumentParser(description='REST API for Kudu.')
+parser.add_argument('testing', nargs='?', default=None)
 parser.add_argument('--masters', '-m', nargs='+', default='localhost',
                     help='The master address(es) to connect to Kudu.')
 parser.add_argument('--ports', '-p', nargs='+', default='7051',
                     help='The master server port(s) to connect to Kudu.')
 args = parser.parse_args()
-app.client = kudu.connect(host=args.masters, port=args.ports)
+
+app.client = None
+if args.testing is None:
+    app.client = kudu.connect(host=args.masters, port=args.ports)
+
 
 @app.get('/')
 def read_root():
@@ -33,12 +39,12 @@ def get_tables() -> TablesResponse:
 # GET api/v1/tables/{table} - load table
 
 
-@app.get('/tables/{table_name}')
-def get_table(table_name: str) -> Table:
-    if not app.client.table_exists(table_name):
+@app.get('/tables/{name}')
+def get_table(name: str) -> Table:
+    if not app.client.table_exists(name):
         raise HTTPException(status_code=404, detail='Table does not exist.')
-    table_name = app.client.table(table_name)
-    table_dict = table_to_dict(table_name)
+    name = app.client.table(name)
+    table_dict = table_to_dict(name)
     return table_dict
 
 # POST api/v1/tables - create new table
@@ -96,19 +102,19 @@ def post_table(table: Table) -> Table:
 # DELETE api/v1/tables/{table} - drop table
 
 
-@app.delete('/tables/{table_name}', status_code=204)
-def delete_table(table_name: str):
-    if not app.client.table_exists(table_name):
+@app.delete('/tables/{name}', status_code=204)
+def delete_table(name: str):
+    if not app.client.table_exists(name):
         raise HTTPException(status_code=404, detail='Table does not exist.')
-    app.client.delete_table(table_name)
+    app.client.delete_table(name)
     return
 
 # PUT api/v1/tables/{table} - update table
 
 
-@app.put('/tables/{table.name}')
-def put_table(table: Table) -> Table:
-    original_table = app.client.table(table.name)
+@app.put('/tables/{name}')
+def put_table(name: str, table: Table) -> Table:
+    original_table = app.client.table(name)
 
     if len(column_names(original_table.schema)) < len(table.table_schema.columns):
         alterer = app.client.new_table_alterer(original_table)
@@ -137,25 +143,28 @@ def put_table(table: Table) -> Table:
                     i).name, rename_to=column.name)
                 original_table = alterer.alter()
     # partition check
+
+    if name != table.name:
+        if app.client.table_exists(table.name):
+            raise HTTPException(
+                status_code=409, detail='Table already exists.')
+        alterer = app.client.new_table_alterer(original_table)
+        original_table = alterer.rename(table.name).alter()
+
     return table_to_dict(original_table)
 
-# PUT api/v1/tables/{table}/rename - rename table
+# GET api/v1/tabletServers - list tablet servers
 
 
-@app.put('/tables/{table_name}/rename')
-def put_table_rename(table_name: str, new_table_name: str):
-    table_name = app.client.table(table_name)
-    if app.client.table_exists(new_table_name):
-        raise HTTPException(status_code=409, detail='Table already exists.')
-    alterer = app.client.new_table_alterer(table_name)
-    table_name = alterer.rename(new_table_name).alter()
-    return table_to_dict(table_name)
-
-# GET api/v1/tables/{table}/tablets - list tablets
-
+@app.get('/tabletServers')
+def get_tablet_servers():
+    tablet_servers = app.client.list_tablet_servers()
+    tablet_servers = [ts.uuid() for ts in tablet_servers]
+    return {'tabletServers': tablet_servers}
 
 def main():
     uvicorn.run('main:app', reload=True)
+
 
 if __name__ == '__main__':
     main()
