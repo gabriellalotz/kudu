@@ -54,25 +54,14 @@ def get_table(name: str) -> Table:
 def post_table(table: Table) -> Table:
     builder = kudu.schema_builder()
     for column in table.table_schema.columns:
-        if column.primary_key:
-            (builder
-             .add_column(column.name)
-             .type(column.type)
-             .nullable(column.nullable)
-             .primary_key())
-        else:
-            (builder
-             .add_column(column.name)
-             .type(column.type)
-             .nullable(column.nullable))
-        if column.precision:
-            builder.precision(column.precision)
-        if column.scale:
-            builder.scale(column.scale)
-        if column.length:
-            builder.length(column.length)
-        if column.comment != "":
-            builder.comment(column.comment)
+        (builder.add_column(column.name,
+                            type_=column.type,
+                            nullable=column.nullable,
+                            primary_key=column.primary_key,
+                            precision=column.precision or None,
+                            scale=column.scale or None,
+                            length=column.length or None,
+                            comment=column.comment))
     try:
         schema = builder.build()
     except Exception as e:
@@ -161,6 +150,7 @@ def get_tablet_servers():
     tablet_servers = app.client.list_tablet_servers()
     tablet_servers = [ts.uuid() for ts in tablet_servers]
     return {'tabletServers': tablet_servers}
+
 
 def main():
     uvicorn.run('main:app', reload=True)

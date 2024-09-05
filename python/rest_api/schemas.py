@@ -17,10 +17,11 @@ class Column(BaseModel):
     # block_size: int = Field(default='None')
     # default: object = Field(default='None')
     # The precision must be between 1 and 38.
-    precision: Optional[int] = Field(default=None)
-    scale: Optional[int] = Field(default=None)
+    precision: Optional[int] = None
+    # The scale must be greater than 0 and less than the column's precision. default is 0
+    scale: Optional[int] = Field(default=0)
     # The length must be between 1 and 65,535 (inclusive).
-    length: Optional[int] = Field(default=None)
+    length: Optional[int] = None
     comment: str = Field(default='')
 
 
