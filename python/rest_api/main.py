@@ -82,7 +82,7 @@ def post_table(table: Table) -> Table:
     if app.client.table_exists(table.name):
         raise HTTPException(status_code=409, detail='Table already exists.')
     try:
-        app.client.create_table(table.name, schema, partitioning)
+        app.client.create_table(table.name, schema, partitioning, comment=table.comment)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
     table = app.client.table(table.name)
