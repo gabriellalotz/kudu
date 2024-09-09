@@ -6,7 +6,7 @@ from fastapi.responses import RedirectResponse
 from utils import table_to_dict, column_names
 from kudu.client import Partitioning
 from fastapi.exceptions import HTTPException
-from schemas import TablesResponse, Table
+from schemas import TablesResponse, Table, TableWithID
 
 
 app = FastAPI(root_path='/api/v1')
@@ -40,7 +40,7 @@ def get_tables() -> TablesResponse:
 
 
 @app.get('/tables/{name}')
-def get_table(name: str) -> Table:
+def get_table(name: str) -> TableWithID:
     if not app.client.table_exists(name):
         raise HTTPException(status_code=404, detail='Table does not exist.')
     name = app.client.table(name)
@@ -51,7 +51,7 @@ def get_table(name: str) -> Table:
 
 
 @app.post('/tables', status_code=201)
-def post_table(table: Table) -> Table:
+def post_table(table: Table) -> TableWithID:
     builder = kudu.schema_builder()
     for column in table.table_schema.columns:
         (builder.add_column(column.name,
@@ -102,7 +102,7 @@ def delete_table(name: str):
 
 
 @app.put('/tables/{name}')
-def put_table(name: str, table: Table) -> Table:
+def put_table(name: str, table: TableWithID) -> TableWithID:
     original_table = app.client.table(name)
 
     if len(column_names(original_table.schema)) < len(table.table_schema.columns):

@@ -36,6 +36,15 @@ class Table(BaseModel):
     hash_partitioning: Optional['HashPartition'] = Field(default=None)
     range_partition_columns: Optional['RangePartitionColumns'] = Field(default=None)
     range_partitioning: Optional['RangePartition'] = Field(default=None)
+    
+class TableWithID(BaseModel):
+    uuid: str
+    name: str
+    table_schema: Schema
+    comment: str = Field(default='')
+    hash_partitioning: Optional['HashPartition'] = Field(default=None)
+    range_partition_columns: Optional['RangePartitionColumns'] = Field(default=None)
+    range_partitioning: Optional['RangePartition'] = Field(default=None)
 
 
 class HashPartition(BaseModel):

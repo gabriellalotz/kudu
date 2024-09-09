@@ -1,6 +1,6 @@
 def table_to_dict(table):
     # compression, encoding, non_unique_primary_key, blocksize, default
-    table_dict = {"name": table.name, "table_schema": {"columns": []}, "comment": table.comment}
+    table_dict = {"uuid": table.id, "name": table.name, "table_schema": {"columns": []}, "comment": table.comment}
     for i in range(len(table.schema)):
         column = table.schema.at(i)
         type = str(column.type)
