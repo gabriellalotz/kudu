@@ -1,4 +1,5 @@
 {
+  "uuid": "example-table",
   "name": "example-table",
   "table_schema": {
     "columns": [
@@ -44,6 +45,7 @@
       }
     ]
   },
+  "comment": "",
   "hash_partitioning": null,
   "range_partition_columns": null,
   "range_partitioning": null

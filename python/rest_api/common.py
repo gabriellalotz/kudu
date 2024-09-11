@@ -196,3 +196,16 @@ class KuduTestBase(object):
         assert update_ignore_errors == metrics["update_ignore_errors"]
         assert successful_deletes == metrics["successful_deletes"]
         assert delete_ignore_errors == metrics["delete_ignore_errors"]
+
+    @classmethod
+    def assert_table_object(cls, object, response):
+        for key in object:
+            if key == "uuid":
+                continue
+            try:
+                assert key in response
+                assert object[key] == response[key]
+            except AssertionError as e:
+                print(f"Key: {key}")
+                raise e
+    

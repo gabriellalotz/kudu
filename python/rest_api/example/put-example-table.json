@@ -1,0 +1,53 @@
+{
+    "uuid": "1de5898d5eb14ed09c29439027862c9a",
+    "name": "example-table",
+    "table_schema": {
+      "columns": [
+        {
+          "name": "key",
+          "type": "int32",
+          "nullable": false,
+          "primary_key": true,
+          "precision": 0,
+          "scale": 0,
+          "length": 0,
+          "comment": "key_comment"
+        },
+        {
+          "name": "int_val",
+          "type": "int32",
+          "nullable": true,
+          "primary_key": false,
+          "precision": 0,
+          "scale": 0,
+          "length": 0,
+          "comment": ""
+        },
+        {
+          "name": "string_val",
+          "type": "string",
+          "nullable": true,
+          "primary_key": false,
+          "precision": 0,
+          "scale": 0,
+          "length": 0,
+          "comment": ""
+        },
+        {
+          "name": "unixtime_micros_val",
+          "type": "unixtime_micros",
+          "nullable": true,
+          "primary_key": false,
+          "precision": 0,
+          "scale": 0,
+          "length": 0,
+          "comment": ""
+        }
+      ]
+    },
+    "comment": "",
+    "hash_partitioning": null,
+    "range_partition_columns": null,
+    "range_partitioning": null
+  }
+  

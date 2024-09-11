@@ -33,6 +33,8 @@ def read_root():
 
 @app.get('/tables')
 def get_tables() -> TablesResponse:
+    if app.client is None:
+        raise HTTPException(status_code=503, detail='Kudu is not available.')
     tables = app.client.list_tables()
     return {'tables': tables}
 
@@ -41,6 +43,8 @@ def get_tables() -> TablesResponse:
 
 @app.get('/tables/{name}')
 def get_table(name: str) -> TableWithID:
+    if app.client is None:
+        raise HTTPException(status_code=503, detail='Kudu is not available.')
     if not app.client.table_exists(name):
         raise HTTPException(status_code=404, detail='Table does not exist.')
     name = app.client.table(name)
@@ -52,6 +56,10 @@ def get_table(name: str) -> TableWithID:
 
 @app.post('/tables', status_code=201)
 def post_table(table: Table) -> TableWithID:
+    if app.client is None:
+        raise HTTPException(status_code=503, detail='Kudu is not available.')
+    if app.client.table_exists(table.name):
+        raise HTTPException(status_code=409, detail='Table already exists.')
     builder = kudu.schema_builder()
     for column in table.table_schema.columns:
         (builder.add_column(column.name,
@@ -79,8 +87,6 @@ def post_table(table: Table) -> TableWithID:
                                          lower_bound_type=table.range_partitioning.lower_bound_type,
                                          upper_bound_type=table.range_partitioning.upper_bound_type)
 
-    if app.client.table_exists(table.name):
-        raise HTTPException(status_code=409, detail='Table already exists.')
     try:
         app.client.create_table(table.name, schema, partitioning, comment=table.comment)
     except Exception as e:
@@ -93,6 +99,8 @@ def post_table(table: Table) -> TableWithID:
 
 @app.delete('/tables/{name}', status_code=204)
 def delete_table(name: str):
+    if app.client is None:
+        raise HTTPException(status_code=503, detail='Kudu is not available.')
     if not app.client.table_exists(name):
         raise HTTPException(status_code=404, detail='Table does not exist.')
     app.client.delete_table(name)
@@ -103,6 +111,9 @@ def delete_table(name: str):
 
 @app.put('/tables/{name}')
 def put_table(name: str, table: TableWithID) -> TableWithID:
+    if app.client is None:
+        raise HTTPException(status_code=503, detail='Kudu is not available.')
+    
     original_table = app.client.table(name)
 
     if len(column_names(original_table.schema)) < len(table.table_schema.columns):
@@ -147,6 +158,8 @@ def put_table(name: str, table: TableWithID) -> TableWithID:
 
 @app.get('/tabletServers')
 def get_tablet_servers():
+    if app.client is None:
+        raise HTTPException(status_code=503, detail='Kudu is not available.')
     tablet_servers = app.client.list_tablet_servers()
     tablet_servers = [ts.uuid() for ts in tablet_servers]
     return {'tabletServers': tablet_servers}
