@@ -47,6 +47,7 @@
 #include "kudu/master/master.proxy.h"
 #include "kudu/master/master_cert_authority.h"
 #include "kudu/master/master_path_handlers.h"
+#include "kudu/master/rest_catalog_path_handlers.h"
 #include "kudu/master/master_service.h"
 #include "kudu/master/ts_manager.h"
 #include "kudu/master/txn_manager.h"
@@ -130,6 +131,12 @@ DEFINE_string(ipki_private_key_password_cmd, "",
 DEFINE_string(tsk_private_key_password_cmd, "",
               "A Unix command whose output returns the password to encrypt "
               "and decrypt the token signing key");
+
+DEFINE_bool(enable_rest_api,
+            false,
+            "Enables REST API endpoints in the master server. The flag webserver_enabled must be "
+            "set to true for this flag to take effect.");
+TAG_FLAG(enable_rest_api, advanced);
 
 DECLARE_bool(txn_manager_lazily_initialized);
 DECLARE_bool(txn_manager_enabled);
@@ -249,6 +256,7 @@ Master::Master(const MasterOptions& opts)
       catalog_manager_(new CatalogManager(this)),
       txn_manager_(FLAGS_txn_manager_enabled ? new TxnManager(this) : nullptr),
       path_handlers_(new MasterPathHandlers(this)),
+      rest_catalog_path_handlers_(new RestCatalogPathHandlers(this)),
       opts_(opts),
       registration_initialized_(false) {
   const auto& location_cmd = FLAGS_location_mapping_cmd;
@@ -294,6 +302,9 @@ Status Master::Init() {
 
   if (web_server_) {
     RETURN_NOT_OK(path_handlers_->Register(web_server_.get()));
+    if (FLAGS_enable_rest_api) {
+      RETURN_NOT_OK(rest_catalog_path_handlers_->Register(web_server_.get()));
+    }
   }
 
   maintenance_manager_.reset(new MaintenanceManager(
