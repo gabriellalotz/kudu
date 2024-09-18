@@ -16,6 +16,7 @@
 // under the License.
 #pragma once
 
+#include <iosfwd>
 #include <string>
 #include <utility>
 
@@ -23,6 +24,7 @@
 #include "kudu/server/webserver.h"
 #include "kudu/util/openssl_util.h"
 #include "kudu/util/status.h"
+#include "kudu/util/web_callback_registry.h"
 
 namespace kudu {
 class EasyJson;
@@ -44,6 +46,10 @@ class MasterPathHandlers {
   Status Register(Webserver* server);
 
  private:
+  void HandleApiTableEndpoint(const Webserver::WebRequest& req,
+                           Webserver::PrerenderedWebResponse* resp);
+  void HandleApiTablesEndpoint(const Webserver::WebRequest& req,
+                 Webserver::PrerenderedWebResponse* resp);
   void HandleTabletServers(const Webserver::WebRequest& req,
                            Webserver::WebResponse* resp);
   void HandleCatalogManager(const Webserver::WebRequest& req,
@@ -57,6 +63,20 @@ class MasterPathHandlers {
                         Webserver::PrerenderedWebResponse* resp);
   void HandleDumpEntities(const Webserver::WebRequest& req,
                           Webserver::PrerenderedWebResponse* resp);
+
+  // Handles REST API endpoints based on the request method and path.
+  void HandleGetTables(std::ostringstream* output, HttpStatusCode* status_code);
+  void HandlePostTables(std::ostringstream* output, const Webserver::WebRequest& req,
+                       HttpStatusCode* status_code);
+  void HandleGetTable(std::ostringstream* output, const Webserver::WebRequest& req,
+                      HttpStatusCode* status_code);
+  void HandlePutTable(std::ostringstream* output, const Webserver::WebRequest& req,
+                      HttpStatusCode* status_code);
+  void HandleDeleteTable(std::ostringstream* output, const Webserver::WebRequest& req,
+                         HttpStatusCode* status_code);
+
+  // Print a JSON object representing a table to 'output'.
+  void PrintTableObject(std::ostringstream* output, const std::string& table_id);
 
   // Returns a pair (text, target) given a tserver's TSDescriptor and a tablet id.
   // - text is the http host and port for the tserver, if available, or the tserver's uuid.
