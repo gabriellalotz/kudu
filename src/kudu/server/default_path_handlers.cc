@@ -440,6 +440,7 @@ static void ConfigurationHandler(const Webserver::WebRequest& /* req */,
   FillSecurityConfigs(output);
   FillTimeSourceConfigs(output);
 }
+
 void AddPreInitializedDefaultPathHandlers(Webserver* webserver) {
   bool on_nav_bar = true;
   webserver->RegisterPathHandler("/logs", "Logs", LogsHandler, StyleMode::STYLED, on_nav_bar);
