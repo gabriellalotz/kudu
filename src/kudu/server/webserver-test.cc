@@ -674,6 +674,39 @@ TEST_F(WebserverTest, TestPutMethodNotAllowed) {
   ASSERT_EQ("Remote error: HTTP 401", s.ToString());
 }
 
+// Test that authenticated principal is correctly passed to the handler.
+void Handler(const Webserver::WebRequest& req, Webserver::PrerenderedWebResponse* resp) {
+  resp->output << req.authn_princ;
+}
+
+class AuthnWebserverTest : public SpnegoWebserverTest {
+ protected:
+  void SetUp() override {
+    WebserverTest::SetUp();
+    server_->RegisterPrerenderedPathHandler("/authn", "AuthnWebserverTest", Handler, StyleMode::UNSTYLED, false);
+  }
+};
+
+class NoAuthnWebserverTest: public WebserverTest {
+ protected:
+  void SetUp() override {
+    WebserverTest::SetUp();
+    server_->RegisterPrerenderedPathHandler("/authn", "NoAuthnWebserverTest", Handler, StyleMode::UNSTYLED, false);
+  }
+};
+
+TEST_F(AuthnWebserverTest, TestAuthenticatedUserPassedToHandler) {
+  ASSERT_OK(kdc_->Kinit("alice"));
+  ASSERT_OK(DoSpnegoCurl());
+  ASSERT_OK(curl_.FetchURL(Substitute("$0/authn", url_), &buf_));
+  ASSERT_STR_CONTAINS(buf_.ToString(), "alice@KRBTEST.COM");
+}
+
+TEST_F(NoAuthnWebserverTest, TestUnauthenticatedUser) {
+  ASSERT_OK(curl_.FetchURL(Substitute("$0/authn", url_), &buf_));
+  ASSERT_STR_CONTAINS(buf_.ToString(), "");
+}
+
 namespace {
 
 // Handler that echoes back the path parameters and query parameters in key-value pairs.
