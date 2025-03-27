@@ -226,6 +226,9 @@ Status EasyCurl::DoRequest(const string& url,
     CURL_RETURN_NOT_OK(curl_easy_setopt(curl_, CURLOPT_PASSWORD, password_.c_str()));
   }
 
+  if (follow_location_) {
+    CURL_RETURN_NOT_OK(curl_easy_setopt(curl_, CURLOPT_FOLLOWLOCATION, 1L));
+  }
   if (verbose_) {
     CURL_RETURN_NOT_OK(curl_easy_setopt(curl_, CURLOPT_VERBOSE, 1));
   }
