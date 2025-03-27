@@ -92,6 +92,10 @@ class EasyCurl {
     return_headers_ = v;
   }
 
+  void set_follow_location(bool v) {
+    follow_location_ = v;
+  }
+
   void set_timeout(MonoDelta t) {
     timeout_ = t;
   }
@@ -176,6 +180,9 @@ class EasyCurl {
 
   // Whether to return the HTTP headers with the response.
   bool return_headers_ = false;
+
+  // Whether to follow redirects.
+  bool follow_location_ = false;
 
   bool verbose_ = false;
 
