@@ -89,6 +89,20 @@ class SpnegoRestCatalogTest : public RestCatalogTestBase {
   Status CreateTestTableAsAlice() { return CreateTestTable("alice@KRBTEST.COM"); }
 };
 
+TEST_F(SpnegoRestCatalogTest, Demo) {
+  ASSERT_OK(kdc_->Kinit(user_princ));
+  EasyCurl c;
+  faststring buf;
+  c.set_verbose(true);
+  c.set_auth(CurlAuthType::SPNEGO);
+  ASSERT_OK(c.FetchURL(
+      Substitute("http://$0/api/v1/tables", cluster_->mini_master()->bound_http_addr().ToString()),
+      &buf));
+  LOG(INFO) << "krb5.conf is at: " << getenv("KRB5_CONFIG");
+
+  sleep(100);
+}
+
 TEST_F(SpnegoRestCatalogTest, TestGetTablesOneTable) {
   ASSERT_OK(kdc_->Kinit(user_princ));
   ASSERT_OK(CreateTestTableAsAlice());
