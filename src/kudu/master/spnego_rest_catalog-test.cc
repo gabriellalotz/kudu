@@ -71,6 +71,7 @@ class SpnegoRestCatalogTest : public RestCatalogTestBase {
     FLAGS_enable_rest_api = true;
 
     InternalMiniClusterOptions opts;
+    opts.num_tablet_servers = 3;
     opts.bind_mode = BindMode::LOOPBACK;
 
     cluster_.reset(new InternalMiniCluster(env_, std::move(opts)));
