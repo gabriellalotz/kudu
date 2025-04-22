@@ -309,7 +309,6 @@ Status ExternalMiniCluster::Start() {
   if (!s.ok() && !s.IsAlreadyPresent()) {
     RETURN_NOT_OK_PREPEND(s, "Could not create root dir " + opts_.cluster_root);
   }
-
   if (opts_.enable_kerberos) {
     kdc_.reset(new MiniKdc(opts_.mini_kdc_options));
     RETURN_NOT_OK(kdc_->Start());
@@ -325,6 +324,10 @@ Status ExternalMiniCluster::Start() {
 
     RETURN_NOT_OK_PREPEND(kdc_->Kinit("test-admin"),
                           "could not kinit as admin");
+
+    RETURN_NOT_OK_PREPEND(
+        kdc_->CreateServiceKeytab("HTTP/127.0.0.1@KRBTEST.COM", &kdc_->spnego_keytab_path),
+        "could not create server keytab");
 
     RETURN_NOT_OK_PREPEND(kdc_->SetKrb5Environment(),
                           "could not set krb5 client env");
@@ -587,7 +590,7 @@ Status ExternalMiniCluster::StartMasters() {
   //
   // TODO(dan): re-bind the ports between node restarts in order to prevent other
   // processess from binding to them in the interim.
-  vector<unique_ptr<Socket>> reserved_sockets;
+  // vector<unique_ptr<Socket>> reserved_sockets;
   vector<HostPort> master_rpc_addrs;
 
   if (!opts_.master_rpc_addresses.empty()) {
@@ -595,17 +598,23 @@ Status ExternalMiniCluster::StartMasters() {
     master_rpc_addrs = opts_.master_rpc_addresses;
   } else {
     for (int i = 0; i < num_masters; i++) {
-      unique_ptr<Socket> reserved_socket;
-      RETURN_NOT_OK_PREPEND(ReserveDaemonSocket(DaemonType::MASTER, i, opts_.bind_mode,
-                                                &reserved_socket),
-                            "failed to reserve master socket address");
-      Sockaddr addr;
-      RETURN_NOT_OK(reserved_socket->GetSocketAddress(&addr));
+      // unique_ptr<Socket> reserved_socket;
+      // RETURN_NOT_OK_PREPEND(ReserveDaemonSocket(DaemonType::MASTER, i, opts_.bind_mode,
+      //                                           &reserved_socket),
+      //                       "failed to reserve master socket address");
+      // Sockaddr addr;
+      // RETURN_NOT_OK(reserved_socket->GetSocketAddress(&addr));
+      struct sockaddr_in addr;
+      memset(&addr, 0, sizeof(addr));
+      addr.sin_family = AF_INET;
+      addr.sin_addr.s_addr = 0x0100007f;
+      Sockaddr sockaddr(addr);
+
       master_rpc_addrs.emplace_back(
           opts_.master_alias_prefix.empty() ?
-              addr.host() : Substitute("$0.$1", opts_.master_alias_prefix, i),
-          addr.port());
-      reserved_sockets.emplace_back(std::move(reserved_socket));
+              sockaddr.host() : Substitute("$0.$1", opts_.master_alias_prefix, i),
+          sockaddr.port());
+      // reserved_sockets.emplace_back(std::move(reserved_socket));
     }
   }
   // Start the masters.
@@ -804,6 +813,8 @@ Status ExternalMiniCluster::CreateMaster(const vector<HostPort>& master_rpc_addr
     RETURN_NOT_OK_PREPEND(
         peer->EnableKerberos(kdc_.get(), opts_.principal, master_rpc_addrs[idx].host()),
         "could not enable Kerberos");
+    flags.emplace_back(Substitute("--spnego_keytab_file=$0",
+                                  kdc_->spnego_keytab_path));
   }
   *master = std::move(peer);
   return Status::OK();
@@ -1484,6 +1495,7 @@ Status ExternalDaemon::CreateKerberosConfig(MiniKdc* kdc,
       "--rpc_authentication=required",
       "--superuser_acl=test-admin",
       "--user_acl=test-user",
+      // Substitute("--spnego_keytab_file=$0", kdc->spnego_keytab_path),
   };
 
   return Status::OK();

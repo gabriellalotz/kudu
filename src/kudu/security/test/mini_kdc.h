@@ -133,6 +133,8 @@ class MiniKdc {
   // a process to use this KDC.
   std::map<std::string, std::string> GetEnvVars() const;
 
+  std::string spnego_keytab_path;
+
  private:
   // Prepends required Kerberos environment variables to the process arguments.
   std::vector<std::string> MakeArgv(const std::vector<std::string>& in_argv);
