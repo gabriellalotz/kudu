@@ -48,8 +48,11 @@
 #include "kudu/rpc/user_credentials.h"
 #include "kudu/security/test/mini_kdc.h"
 #include "kudu/transactions/txn_system_client.h"
+#include "kudu/util/curl_util.h"
 #include "kudu/util/decimal_util.h"
+#include "kudu/util/faststring.h"
 #include "kudu/util/monotime.h"
+#include "kudu/util/net/net_util.h"
 #include "kudu/util/slice.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
@@ -327,6 +330,8 @@ class MasterAuthzITestHarness {
     // authorized.
     opts.extra_master_flags.emplace_back("--trusted_user_acl=impala");
     opts.extra_master_flags.emplace_back("--user_acl=test-user,impala,alice");
+    opts.extra_master_flags.emplace_back("--enable_rest_api");
+
     SetUpExternalMiniServiceOpts(&opts);
     return opts;
   }
@@ -977,6 +982,82 @@ TEST_P(MasterAuthzITest, TestAlterAndChangeOwner) {
 
   this->GrantAllWithGrantTablePrivilege({kDatabaseName, kTableName});
   ASSERT_OK(alterer->Alter());
+}
+
+TEST_P(MasterAuthzITest, TestTableIsolationBetweenUsersWithRestApi) {
+  // Create table with User A, verify isolation: User A creates a new table.
+  // Verify that User B cannot access it using PUT or DELETE endpoints.
+  NO_FATALS(this->GrantCreateTablePrivilege({kDatabaseName}));
+  ASSERT_OK(CreateKuduTable(kDatabaseName, "test_table"));
+
+  ASSERT_OK(cluster_->kdc()->Kinit(kSecondUser));
+  shared_ptr<KuduTable> table;
+  ASSERT_OK(this->client_->OpenTable(Substitute("$0.$1", kDatabaseName, "test_table"), &table));
+  string table_id = table->id();
+  EasyCurl c;
+  faststring buf;
+  c.set_auth(CurlAuthType::SPNEGO);
+  c.set_custom_method("DELETE");
+   Status s = c.FetchURL(Substitute("http://$0/api/v1/tables/$1",
+                                   cluster_->master()->bound_http_hostport().ToString(),
+                                   table_id),
+                        &buf);
+  ASSERT_STR_CONTAINS(s.ToString(), "HTTP 403");
+  ASSERT_STR_CONTAINS(buf.ToString(), "{\"error\":\"Not authorized: Unauthorized action\"}");
+  c.set_custom_method("PUT");
+  s = c.PostToURL(Substitute("http://$0/api/v1/tables/$1",
+                             cluster_->master()->bound_http_hostport().ToString(),
+                             table_id),
+                  R"({
+                    "table": {
+                      "table_name": "test_table"
+                    },
+                    "alter_schema_steps": [
+                      {
+                        "type": "ADD_COLUMN",
+                        "add_column": {
+                          "schema": {
+                            "name": "new_column",
+                            "type": "STRING",
+                            "is_nullable": true
+                          }
+                        }
+                      }
+                    ]
+                  }
+                  )",
+                  &buf);
+  ASSERT_STR_CONTAINS(s.ToString(), "HTTP 403");
+  ASSERT_STR_CONTAINS(buf.ToString(), "{\"error\":\"Not authorized: Unauthorized action\"}");
+}
+
+
+TEST_P(MasterAuthzITest, TestListTablesIsolationBetweenUsersWithRestApi) {
+  // User A and User B create separate tables. When performing
+  // a GET /api/v1/tables, each user should only see the tables
+  // they created
+  NO_FATALS(this->GrantCreateTablePrivilege({kDatabaseName}));
+  NO_FATALS(this->GrantAllTablePrivilege({kDatabaseName, "test_table"}));
+  ASSERT_OK(CreateKuduTable(kDatabaseName, "test_table"));
+  ASSERT_OK(cluster_->kdc()->Kinit(kTestUser));
+  EasyCurl c;
+  faststring buf;
+  c.set_auth(CurlAuthType::SPNEGO);
+  ASSERT_OK(c.FetchURL(
+      Substitute("http://$0/api/v1/tables", cluster_->master()->bound_http_hostport().ToString()),
+      &buf));
+  shared_ptr<KuduTable> table;
+  ASSERT_OK(this->client_->OpenTable(Substitute("$0.$1", kDatabaseName, "test_table"), &table));
+  string table_id = table->id();
+  ASSERT_STR_CONTAINS(
+      buf.ToString(),
+      Substitute("{\"tables\":[{\"table_id\":\"$0\",\"table_name\":\"test_table\"}]}", table_id));
+
+  ASSERT_OK(cluster_->kdc()->Kinit(kSecondUser));
+  ASSERT_OK(c.FetchURL(
+      Substitute("http://$0/api/v1/tables", cluster_->master()->bound_http_hostport().ToString()),
+      &buf));
+  ASSERT_STR_CONTAINS(buf.ToString(), "{\"tables\":[]}");
 }
 
 class MasterAuthzOwnerITest : public MasterAuthzITestBase,

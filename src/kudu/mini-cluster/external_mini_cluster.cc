@@ -310,7 +310,6 @@ Status ExternalMiniCluster::Start() {
   if (!s.ok() && !s.IsAlreadyPresent()) {
     RETURN_NOT_OK_PREPEND(s, "Could not create root dir " + opts_.cluster_root);
   }
-
   if (opts_.enable_kerberos) {
     kdc_.reset(new MiniKdc(opts_.mini_kdc_options));
     RETURN_NOT_OK(kdc_->Start());
