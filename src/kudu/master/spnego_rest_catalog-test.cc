@@ -16,15 +16,18 @@
 // under the License.
 
 #include <memory>
+#include <set>
 #include <string>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include <gflags/gflags_declare.h>
 #include <gtest/gtest.h>
 
 #include "kudu/client/client.h"
 #include "kudu/client/schema.h"
+#include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/master/mini_master.h"
 #include "kudu/master/rest_catalog_test_base.h"
@@ -34,6 +37,7 @@
 #include "kudu/util/faststring.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
+#include "kudu/util/regex.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
@@ -48,7 +52,9 @@ using kudu::client::KuduTable;
 using kudu::client::sp::shared_ptr;
 using kudu::cluster::InternalMiniCluster;
 using kudu::cluster::InternalMiniClusterOptions;
+using std::set;
 using std::string;
+using std::vector;
 using std::unique_ptr;
 using strings::Substitute;
 
@@ -275,6 +281,103 @@ TEST_F(SpnegoRestCatalogTest, TestUnauthenticatedBadKeytab) {
 }
 
 #endif
+
+class MultiMasterSpnegoTest : public RestCatalogTestBase {
+ public:
+  void SetUp() override {
+    KuduTest::SetUp();
+
+    kdc_.reset(new MiniKdc(MiniKdcOptions{}));
+    ASSERT_OK(kdc_->Start());
+    ASSERT_OK(kdc_->SetKrb5Environment());
+    string kt_path;
+    ASSERT_OK(kdc_->CreateServiceKeytabWithName("HTTP/127.0.0.1", "spnego.dedicated", &kt_path));
+    ASSERT_OK(kdc_->CreateUserPrincipal(kDefaultPrincipal));
+    FLAGS_spnego_keytab_file = kt_path;
+    FLAGS_webserver_require_spnego = true;
+    FLAGS_enable_rest_api = true;
+
+    InternalMiniClusterOptions opts;
+    opts.bind_mode = BindMode::LOOPBACK;
+    opts.num_masters = 3;
+
+    cluster_.reset(new InternalMiniCluster(env_, std::move(opts)));
+    ASSERT_OK(cluster_->Start());
+    KuduClientBuilder client_builder;
+    ASSERT_OK(cluster_->CreateClient(&client_builder, &client_));
+  }
+
+ protected:
+  unique_ptr<MiniKdc> kdc_;
+  unique_ptr<InternalMiniCluster> cluster_;
+  const string kDefaultPrincipal = "alice";
+};
+
+TEST_F(MultiMasterSpnegoTest, TestAuthenticatedLeaderAccess) {
+  // Test authenticated access to leader endpoint across all masters
+  ASSERT_OK(kdc_->Kinit(kDefaultPrincipal));
+
+  set<string> leader_addresses;
+  static KuduRegex re("\"leader\":\"([^\"]+)\"", 1);
+
+  EasyCurl c;
+  c.set_auth(CurlAuthType::SPNEGO);
+  faststring buf;
+  ASSERT_OK(c.FetchURL(Substitute("http://$0/api/v1/leader",
+                                  cluster_->mini_master(0)->bound_http_addr().ToString()),
+                        &buf));
+  vector<string> matches;
+  ASSERT_TRUE(re.Match(buf.ToString(), &matches));
+  leader_addresses.insert(matches[0]);
+
+  // All masters should report the same leader with authentication
+  ASSERT_EQ(1, leader_addresses.size()) << "Authenticated requests yielded different leaders: "
+                                        << JoinStrings(leader_addresses, ", ");
+}
+
+TEST_F(MultiMasterSpnegoTest, TestUnauthenticatedRequestsRejected) {
+  // Test that requests without authentication are properly rejected
+  for (int i = 0; i < cluster_->num_masters(); i++) {
+    EasyCurl c;
+    faststring buf;
+    Status s = c.FetchURL(Substitute("http://$0/api/v1/tables",
+                                     cluster_->mini_master(i)->bound_http_addr().ToString()),
+                          &buf);
+    ASSERT_STR_CONTAINS(s.ToString(), "HTTP 401");
+    ASSERT_STR_CONTAINS(buf.ToString(), "Must authenticate with SPNEGO");
+  }
+}
+
+TEST_F(MultiMasterSpnegoTest, TestTableOperationsWithAuthentication) {
+  // Test table operations with proper authentication across all masters
+  ASSERT_OK(kdc_->Kinit(kDefaultPrincipal));
+  ASSERT_OK(CreateTestTable(kDefaultPrincipal));
+  string table_id;
+  ASSERT_OK(GetTableId(kTableName, &table_id));
+
+  // First identify the leader master
+  EasyCurl c;
+  c.set_auth(CurlAuthType::SPNEGO);
+  faststring buf;
+  string leader_addr;
+
+  ASSERT_OK(c.FetchURL(
+      Substitute("http://$0/api/v1/leader", cluster_->mini_master(0)->bound_http_addr().ToString()),
+      &buf));
+  static KuduRegex re("\"leader\":\"([^\"]+)\"", 1);
+  vector<string> matches;
+  if (re.Match(buf.ToString(), &matches)) {
+    leader_addr = matches[0];
+  }
+
+  ASSERT_FALSE(leader_addr.empty()) << "Could not determine leader master address";
+
+  ASSERT_OK(c.FetchURL(Substitute("$0/api/v1/tables", leader_addr), &buf));
+  ASSERT_STR_CONTAINS(buf.ToString(), table_id);
+
+  ASSERT_OK(c.FetchURL(Substitute("$0/api/v1/tables/$1", leader_addr, table_id), &buf));
+  ASSERT_STR_CONTAINS(buf.ToString(), kDefaultPrincipal);
+}
 
 }  // namespace master
 }  // namespace kudu

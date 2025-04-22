@@ -48,8 +48,11 @@
 #include "kudu/rpc/user_credentials.h"
 #include "kudu/security/test/mini_kdc.h"
 #include "kudu/transactions/txn_system_client.h"
+#include "kudu/util/curl_util.h"
 #include "kudu/util/decimal_util.h"
+#include "kudu/util/faststring.h"
 #include "kudu/util/monotime.h"
+#include "kudu/util/net/net_util.h"
 #include "kudu/util/slice.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
@@ -327,6 +330,8 @@ class MasterAuthzITestHarness {
     // authorized.
     opts.extra_master_flags.emplace_back("--trusted_user_acl=impala");
     opts.extra_master_flags.emplace_back("--user_acl=test-user,impala,alice");
+    opts.extra_master_flags.emplace_back("--enable_rest_api");
+
     SetUpExternalMiniServiceOpts(&opts);
     return opts;
   }
@@ -977,6 +982,244 @@ TEST_P(MasterAuthzITest, TestAlterAndChangeOwner) {
 
   this->GrantAllWithGrantTablePrivilege({kDatabaseName, kTableName});
   ASSERT_OK(alterer->Alter());
+}
+
+// REST API Authorization Integration Tests
+//
+// These tests verify that the REST API properly enforces authorization
+// for all operations, ensuring proper isolation between users and correct
+// privilege checking with Kerberos principal mapping.
+
+TEST_P(MasterAuthzITest, TestTableIsolationBetweenUsersWithRestApi) {
+  // Create table with User A, verify isolation: User A creates a new table.
+  // Verify that User B cannot access it using PUT or DELETE endpoints.
+  NO_FATALS(this->GrantCreateTablePrivilege({kDatabaseName}));
+  NO_FATALS(this->GrantDropTablePrivilege({kDatabaseName, "test_table"}));
+  ASSERT_OK(CreateKuduTable(kDatabaseName, "test_table"));
+
+  ASSERT_OK(cluster_->kdc()->Kinit(kSecondUser));
+  shared_ptr<KuduTable> table;
+  ASSERT_OK(this->client_->OpenTable(Substitute("$0.$1", kDatabaseName, "test_table"), &table));
+  string table_id = table->id();
+
+  EasyCurl c;
+  faststring buf;
+  c.set_auth(CurlAuthType::SPNEGO);
+  c.set_custom_method("DELETE");
+
+  Status s = c.FetchURL(Substitute("http://$0/api/v1/tables/$1",
+                                   cluster_->master()->bound_http_hostport().ToString(),
+                                   table_id),
+                        &buf);
+  ASSERT_STR_CONTAINS(s.ToString(), "HTTP 403");
+  ASSERT_STR_CONTAINS(buf.ToString(), "{\"error\":\"Not authorized: Unauthorized action\"}");
+
+  c.set_custom_method("PUT");
+  s = c.PostToURL(Substitute("http://$0/api/v1/tables/$1",
+                             cluster_->master()->bound_http_hostport().ToString(),
+                             table_id),
+                  R"({
+                    "table": {
+                      "table_name": "test_table"
+                    },
+                    "alter_schema_steps": [
+                      {
+                        "type": "ADD_COLUMN",
+                        "add_column": {
+                          "schema": {
+                            "name": "new_column",
+                            "type": "STRING",
+                            "is_nullable": true
+                          }
+                        }
+                      }
+                    ]
+                  }
+                  )",
+                  &buf);
+  ASSERT_STR_CONTAINS(s.ToString(), "HTTP 403");
+  ASSERT_STR_CONTAINS(buf.ToString(), "{\"error\":\"Not authorized: Unauthorized action\"}");
+
+  // User A should still be able to access the table.
+  ASSERT_OK(cluster_->kdc()->Kinit(kTestUser));
+
+  // User A can delete the table.
+  c.set_custom_method("DELETE");
+  ASSERT_OK(c.FetchURL(Substitute("http://$0/api/v1/tables/$1",
+                                  cluster_->master()->bound_http_hostport().ToString(),
+                                  table_id),
+                       &buf));
+}
+
+TEST_P(MasterAuthzITest, TestRestApiCreateTableWithAuthorization) {
+  // Test that users can only create tables when they have proper privileges
+  const string table_name = Substitute("$0.rest_api_create_test", kDatabaseName);
+  const string table_json = R"({
+    "name": ")" + table_name +
+                            R"(",
+    "schema": {
+      "columns": [
+        {"name": "key", "type": "INT32", "is_nullable": false, "is_key": true},
+        {"name": "value", "type": "STRING", "is_nullable": true}
+      ]
+    },
+    "partition_schema": {
+      "range_schema": {
+        "columns": [{"name": "key"}]
+      }
+    },
+    "num_replicas": 1
+  })";
+
+  EasyCurl c;
+  c.set_auth(CurlAuthType::SPNEGO);
+  faststring buf;
+
+  // User without CREATE privileges should get 403
+  ASSERT_OK(cluster_->kdc()->Kinit(kTestUser));
+  Status s = c.PostToURL(
+      Substitute("http://$0/api/v1/tables", cluster_->master()->bound_http_hostport().ToString()),
+      table_json,
+      &buf);
+  ASSERT_STR_CONTAINS(s.ToString(), "HTTP 403");
+  ASSERT_STR_CONTAINS(buf.ToString(), "error");
+  ASSERT_STR_CONTAINS(buf.ToString(), "Unauthorized action");
+
+  // User with CREATE privileges should succeed
+  // Use a different table name to avoid conflicts
+  const string second_table_name = Substitute("$0.rest_api_create_test_authorized", kDatabaseName);
+  const string second_table_json = R"({
+    "name": ")" + second_table_name +
+                                   R"(",
+    "schema": {
+      "columns": [
+        {"name": "key", "type": "INT32", "is_nullable": false, "is_key": true},
+        {"name": "value", "type": "STRING", "is_nullable": true}
+      ]
+    },
+    "partition_schema": {
+      "range_schema": {
+        "columns": [{"name": "key"}]
+      }
+    },
+    "num_replicas": 1
+  })";
+
+  NO_FATALS(this->GrantCreateTablePrivilege({kDatabaseName}));
+  NO_FATALS(this->GrantGetMetadataTablePrivilege(
+      {kDatabaseName, "rest_api_create_test_authorized", kTestUser}));
+
+  ASSERT_OK(c.PostToURL(
+      Substitute("http://$0/api/v1/tables", cluster_->master()->bound_http_hostport().ToString()),
+      second_table_json,
+      &buf));
+
+  ASSERT_STR_CONTAINS(buf.ToString(), "name");
+  ASSERT_STR_CONTAINS(buf.ToString(), "rest_api_create_test_authorized");
+  ASSERT_STR_CONTAINS(buf.ToString(), "id");
+}
+
+TEST_P(MasterAuthzITest, TestRestApiDeleteTableWithAuthorization) {
+  // Test that users can only delete tables when they have proper privileges
+  const string table_name = "rest_api_delete_test";
+
+  NO_FATALS(this->GrantCreateTablePrivilege({kDatabaseName}));
+  ASSERT_OK(CreateKuduTable(kDatabaseName, table_name));
+
+  shared_ptr<KuduTable> table;
+  ASSERT_OK(this->client_->OpenTable(Substitute("$0.$1", kDatabaseName, table_name), &table));
+  string table_id = table->id();
+
+  EasyCurl c;
+  c.set_auth(CurlAuthType::SPNEGO);
+  c.set_custom_method("DELETE");
+  faststring buf;
+
+  // User without DROP privileges should get 403
+  ASSERT_OK(cluster_->kdc()->Kinit(kSecondUser));
+  Status s = c.FetchURL(Substitute("http://$0/api/v1/tables/$1",
+                                   cluster_->master()->bound_http_hostport().ToString(),
+                                   table_id),
+                        &buf);
+  ASSERT_STR_CONTAINS(s.ToString(), "HTTP 403");
+  ASSERT_STR_CONTAINS(buf.ToString(), "error");
+  ASSERT_STR_CONTAINS(buf.ToString(), "Unauthorized action");
+
+  // User with DROP privileges should succeed
+  NO_FATALS(this->GrantDropTablePrivilege({kDatabaseName, table_name, kSecondUser}));
+  ASSERT_OK(c.FetchURL(Substitute("http://$0/api/v1/tables/$1",
+                            cluster_->master()->bound_http_hostport().ToString(),
+                            table_id),
+                 &buf));
+
+  // Verify table is actually deleted
+  Status open_status =
+      this->client_->OpenTable(Substitute("$0.$1", kDatabaseName, table_name), &table);
+  ASSERT_TRUE(open_status.IsNotFound());
+}
+
+TEST_P(MasterAuthzITest, TestRestApiPrincipalMapping) {
+  // Test that Kerberos principals are properly mapped to local usernames
+
+  const string table_name = "principal_mapping_test";
+
+  NO_FATALS(this->GrantCreateTablePrivilege({kDatabaseName}));
+  ASSERT_OK(CreateKuduTable(kDatabaseName, table_name));
+
+  // Grant access to alice using her local username
+  NO_FATALS(this->GrantGetMetadataTablePrivilege({kDatabaseName, table_name, kSecondUser}));
+
+  shared_ptr<KuduTable> table;
+  ASSERT_OK(this->client_->OpenTable(Substitute("$0.$1", kDatabaseName, table_name), &table));
+  string table_id = table->id();
+
+  // Alice should be able to access the table via REST API
+  // This verifies that her Kerberos principal (alice@KRBTEST.COM) is properly
+  // mapped to the local username (alice) that has the privileges
+  ASSERT_OK(cluster_->kdc()->Kinit(kSecondUser));
+
+  EasyCurl c;
+  c.set_auth(CurlAuthType::SPNEGO);
+  faststring buf;
+
+  ASSERT_OK(c.FetchURL(Substitute("http://$0/api/v1/tables/$1",
+                                  cluster_->master()->bound_http_hostport().ToString(),
+                                  table_id),
+                       &buf));
+
+  // Should return table details, proving the principal mapping worked
+  ASSERT_STR_CONTAINS(buf.ToString(), "name");
+  ASSERT_STR_CONTAINS(buf.ToString(), table_name);
+  ASSERT_STR_CONTAINS(buf.ToString(), "id");
+  ASSERT_STR_CONTAINS(buf.ToString(), "schema");
+}
+
+TEST_P(MasterAuthzITest, TestListTablesIsolationWithRestApi) {
+  // User A creates a table, User B should not see it in list tables
+  const string table_name = "rest_api_list_tables_test";
+  NO_FATALS(this->GrantCreateTablePrivilege({kDatabaseName}));
+  ASSERT_OK(CreateKuduTable(kDatabaseName, table_name));
+  shared_ptr<KuduTable> table;
+  ASSERT_OK(this->client_->OpenTable(Substitute("$0.$1", kDatabaseName, table_name), &table));
+  string table_id = table->id();
+
+  // User A should see the table in list tables
+  EasyCurl c;
+  c.set_auth(CurlAuthType::SPNEGO);
+  faststring buf;
+  ASSERT_OK(cluster_->kdc()->Kinit(kTestUser));
+  ASSERT_OK(c.FetchURL(
+      Substitute("http://$0/api/v1/tables", cluster_->master()->bound_http_hostport().ToString()),
+      &buf));
+  ASSERT_STR_CONTAINS(buf.ToString(), table_name);
+  ASSERT_STR_CONTAINS(buf.ToString(), table_id);
+
+  // User B should not see the table in list tables
+  ASSERT_OK(cluster_->kdc()->Kinit(kSecondUser));
+  ASSERT_OK(c.FetchURL(
+      Substitute("http://$0/api/v1/tables", cluster_->master()->bound_http_hostport().ToString()),
+      &buf));
+  ASSERT_STR_CONTAINS(buf.ToString(), "\"tables\":[]");
 }
 
 class MasterAuthzOwnerITest : public MasterAuthzITestBase,
