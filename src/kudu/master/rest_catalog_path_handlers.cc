@@ -19,6 +19,7 @@
 
 #include <functional>
 #include <optional>
+#include <ostream>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -42,6 +43,8 @@
 #include "kudu/util/monotime.h"
 #include "kudu/util/status.h"
 #include "kudu/util/web_callback_registry.h"
+
+DECLARE_bool(webserver_require_spnego);
 
 // We only use macros here to maintain cohesion with the existing RETURN_NOT_OK-style pattern.
 // They provide a consistent way to return JSON-formatted error responses.
@@ -217,6 +220,18 @@ void RestCatalogPathHandlers::HandleLeaderEndpoint(const Webserver::WebRequest& 
     return;
   }
   RETURN_JSON_ERROR(jw, "No leader master found", resp->status_code, HttpStatusCode::NotFound);
+}
+
+void RestCatalogPathHandlers::HandleApiDocsEndpoint(const Webserver::WebRequest& req,
+                                                    Webserver::WebResponse* resp) {
+  if (req.request_method != "GET") {
+    resp->status_code = HttpStatusCode::MethodNotAllowed;
+    return;
+  }
+
+  // Set template variables - the webserver will automatically handle Knox base_url
+  resp->output["spnego_enabled"] = FLAGS_webserver_require_spnego;
+  resp->status_code = HttpStatusCode::Ok;
 }
 
 void RestCatalogPathHandlers::HandleGetTables(std::ostringstream* output,
@@ -449,6 +464,14 @@ void RestCatalogPathHandlers::Register(Webserver* server) {
       },
       StyleMode::JSON,
       false);
+  server->RegisterPathHandler(
+      "/api/docs",
+      "REST API Docs",
+      [this](const Webserver::WebRequest& req, Webserver::WebResponse* resp) {
+        this->HandleApiDocsEndpoint(req, resp);
+      },
+      StyleMode::STYLED,
+      true);
 }
 
 }  // namespace master
