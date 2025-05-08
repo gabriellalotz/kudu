@@ -48,6 +48,27 @@ ADD_EXPORTABLE_LIBRARY(txn_manager_proto
   DEPS ${TXN_MANAGER_KRPC_LIBS}
   NONLINK_DEPS ${TXN_MANAGER_KRPC_TGTS})
 
+set(SWAGGER_SOURCE_FILE ${CMAKE_CURRENT_SOURCE_DIR}/rest_catalog_path_handlers.cc)
+set(SWAGGER_OUTPUT_FILE ${CMAKE_SOURCE_DIR}/www/swagger/kudu-api-generated.json)
+
+# Add custom command to generate swagger documentation
+add_custom_command(
+  OUTPUT ${SWAGGER_OUTPUT_FILE}
+  COMMAND python3 ${CMAKE_SOURCE_DIR}/build-support/gen_swagger.py
+    --source-file ${SWAGGER_SOURCE_FILE}
+    --output ${SWAGGER_OUTPUT_FILE}
+    --verbose
+  DEPENDS ${SWAGGER_SOURCE_FILE}
+    ${CMAKE_SOURCE_DIR}/build-support/gen_swagger.py
+  COMMENT "Generating Swagger API documentation from REST handlers"
+  VERBATIM
+)
+
+# Create a target for swagger generation
+add_custom_target(swagger-gen
+  DEPENDS ${SWAGGER_OUTPUT_FILE}
+)
+
 set(MASTER_SRCS
   authz_provider.cc
   auto_rebalancer.cc

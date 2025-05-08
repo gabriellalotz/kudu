@@ -43,6 +43,8 @@
 #include "kudu/util/status.h"
 #include "kudu/util/web_callback_registry.h"
 
+DECLARE_bool(webserver_require_spnego);
+
 // We only use macros here to maintain cohesion with the existing RETURN_NOT_OK-style pattern.
 // They provide a consistent way to return JSON-formatted error responses.
 #define RETURN_JSON_ERROR(jw, error_msg, status_code, error_code) \
@@ -217,6 +219,33 @@ void RestCatalogPathHandlers::HandleLeaderEndpoint(const Webserver::WebRequest& 
     return;
   }
   RETURN_JSON_ERROR(jw, "No leader master found", resp->status_code, HttpStatusCode::NotFound);
+}
+
+void RestCatalogPathHandlers::HandleApiDocsEndpoint(const Webserver::WebRequest& req,
+                                                    Webserver::PrerenderedWebResponse* resp) {
+  if (req.request_method != "GET") {
+    resp->status_code = HttpStatusCode::MethodNotAllowed;
+    resp->output << "Method not allowed";
+    return;
+  }
+
+  // If SPNEGO is enabled, provide alternative documentation since
+  // Swagger UI cannot work with authentication required for static resources
+  if (FLAGS_webserver_require_spnego) {
+    resp->status_code = HttpStatusCode::Ok;
+    resp->response_headers["Content-Type"] = "text/plain";
+    resp->output
+        << "Interactive Swagger UI is not available when SPNEGO authentication is enabled.\n\n"
+        << "Alternatives:\n"
+        << "1. Download OpenAPI spec: /swagger/kudu-api.json\n"
+        << "2. Use external tools: Import the spec into Postman, Insomnia, or other API clients\n"
+        << "3. Command line: Use curl with --negotiate -u : for SPNEGO authentication\n\n";
+  } else {
+    // Use HTTP 307 redirect to swagger UI (original behavior for non-SPNEGO)
+    resp->status_code = HttpStatusCode::TemporaryRedirect;
+    resp->response_headers["Location"] = "/swagger/index.html";
+    resp->output << "Redirecting to API documentation...";
+  }
 }
 
 void RestCatalogPathHandlers::HandleGetTables(std::ostringstream* output,
@@ -449,6 +478,14 @@ void RestCatalogPathHandlers::Register(Webserver* server) {
       },
       StyleMode::JSON,
       false);
+  server->RegisterPrerenderedPathHandler(
+      "/api/docs",
+      "API Documentation",
+      [this](const Webserver::WebRequest& req, Webserver::PrerenderedWebResponse* resp) {
+        this->HandleApiDocsEndpoint(req, resp);
+      },
+      StyleMode::UNSTYLED,
+      true);
 }
 
 }  // namespace master

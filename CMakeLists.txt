@@ -1496,6 +1496,10 @@ if (UNIX)
     # The docs output HTML will end up in a docs/ subdir.
     ${CMAKE_CURRENT_SOURCE_DIR}/docs/support/scripts/make_docs.sh
       --build_root ${CMAKE_CURRENT_BINARY_DIR})
+  # Add swagger generation to docs if swagger-gen target exists
+  if(TARGET swagger-gen)
+    add_dependencies(docs swagger-gen)
+  endif()
 endif (UNIX)
 
 ############################################################
