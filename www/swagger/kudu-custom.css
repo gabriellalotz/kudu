@@ -1,0 +1,32 @@
+/* Custom styles for embedded Swagger UI in Kudu */
+
+/* Hide any remaining navbar/header elements */
+.swagger-ui .topbar,
+.swagger-ui .swagger-ui-wrap > .topbar,
+.swagger-ui .header,
+.swagger-ui .info .title,
+.swagger-ui .info hgroup.main {
+  display: none !important;
+}
+
+/* Style the API description to be bigger and bold */
+.swagger-ui .info .description,
+.swagger-ui .info p {
+  font-size: 18px !important;
+  font-weight: bold !important;
+  color: #3b4151 !important;
+  margin-bottom: 20px !important;
+}
+
+.swagger-ui {
+  max-width: none !important;
+}
+
+.swagger-ui .wrapper {
+  padding-top: 0 !important;
+}
+
+.swagger-ui .scheme-container {
+  margin-top: 0 !important;
+  padding-top: 0 !important;
+}

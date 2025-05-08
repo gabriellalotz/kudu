@@ -19,6 +19,7 @@
 
 #include <functional>
 #include <optional>
+#include <ostream>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -42,6 +43,12 @@
 #include "kudu/util/monotime.h"
 #include "kudu/util/status.h"
 #include "kudu/util/web_callback_registry.h"
+#include "kudu/util/env.h"
+#include "kudu/util/path_util.h"
+#include "kudu/util/faststring.h"
+
+DECLARE_bool(webserver_require_spnego);
+DECLARE_string(webserver_doc_root);
 
 // We only use macros here to maintain cohesion with the existing RETURN_NOT_OK-style pattern.
 // They provide a consistent way to return JSON-formatted error responses.
@@ -217,6 +224,43 @@ void RestCatalogPathHandlers::HandleLeaderEndpoint(const Webserver::WebRequest& 
     return;
   }
   RETURN_JSON_ERROR(jw, "No leader master found", resp->status_code, HttpStatusCode::NotFound);
+}
+
+void RestCatalogPathHandlers::HandleApiDocsEndpoint(const Webserver::WebRequest& req,
+                                                    Webserver::WebResponse* resp) {
+  if (req.request_method != "GET") {
+    resp->status_code = HttpStatusCode::MethodNotAllowed;
+    return;
+  }
+
+  // Set template variables - the webserver will automatically handle Knox base_url
+  resp->output["spnego_enabled"] = FLAGS_webserver_require_spnego;
+  resp->status_code = HttpStatusCode::Ok;
+}
+
+void RestCatalogPathHandlers::HandleApiSpecEndpoint(const Webserver::WebRequest& req,
+                                                    Webserver::PrerenderedWebResponse* resp) {
+  if (req.request_method != "GET") {
+    resp->status_code = HttpStatusCode::MethodNotAllowed;
+    resp->output << "Method not allowed";
+    return;
+  }
+
+  // Read the kudu-api.json file and serve its contents
+  const string spec_file_path = Substitute("$0/swagger/kudu-api.json", 
+                                           FLAGS_webserver_doc_root);
+  faststring spec_content;
+  Status s = ReadFileToString(Env::Default(), spec_file_path, &spec_content);
+  
+  if (!s.ok()) {
+    resp->status_code = HttpStatusCode::NotFound;
+    resp->output << Substitute("Could not read API specification: $0", s.ToString());
+    return;
+  }
+
+  resp->status_code = HttpStatusCode::Ok;
+  resp->response_headers["Content-Type"] = "application/json";
+  resp->output << spec_content.ToString();
 }
 
 void RestCatalogPathHandlers::HandleGetTables(std::ostringstream* output,
@@ -446,6 +490,22 @@ void RestCatalogPathHandlers::Register(Webserver* server) {
       "",
       [this](const Webserver::WebRequest& req, Webserver::PrerenderedWebResponse* resp) {
         this->HandleLeaderEndpoint(req, resp);
+      },
+      StyleMode::JSON,
+      false);
+  server->RegisterPathHandler(
+      "/api/docs",
+      "REST API Docs",
+      [this](const Webserver::WebRequest& req, Webserver::WebResponse* resp) {
+        this->HandleApiDocsEndpoint(req, resp);
+      },
+      StyleMode::STYLED,
+      true);
+  server->RegisterPrerenderedPathHandler(
+      "/api/v1/spec",
+      "",
+      [this](const Webserver::WebRequest& req, Webserver::PrerenderedWebResponse* resp) {
+        this->HandleApiSpecEndpoint(req, resp);
       },
       StyleMode::JSON,
       false);
