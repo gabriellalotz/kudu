@@ -149,6 +149,7 @@ Status InternalMiniCluster::StartMasters() {
       Sockaddr addr;
       RETURN_NOT_OK(reserved_socket->GetSocketAddress(&addr));
 
+      addr.set_port(42939);
       master_rpc_addrs.emplace_back(addr.host(), addr.port());
       reserved_sockets.emplace_back(std::move(reserved_socket));
     }

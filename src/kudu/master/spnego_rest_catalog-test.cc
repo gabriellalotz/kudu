@@ -101,7 +101,7 @@ TEST_F(SpnegoRestCatalogTest, Demo) {
       &buf));
   LOG(INFO) << "krb5.conf is at: " << getenv("KRB5_CONFIG");
 
-  sleep(100);
+  sleep(10000);
 }
 
 TEST_F(SpnegoRestCatalogTest, TestGetTablesOneTable) {
