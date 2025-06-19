@@ -333,6 +333,9 @@ struct ExternalMiniClusterOptions {
   //
   // Default: true
   bool start_jwks = true;
+
+  // If true, the REST API is enabled on the webserver.
+  bool enable_rest_api;
 };
 
 // A mini-cluster made up of subprocesses running each of the daemons
