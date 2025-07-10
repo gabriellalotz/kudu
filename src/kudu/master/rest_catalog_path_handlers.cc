@@ -19,6 +19,7 @@
 
 #include <functional>
 #include <optional>
+#include <ostream>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -36,6 +37,7 @@
 #include "kudu/master/catalog_manager.h"
 #include "kudu/master/master.h"
 #include "kudu/master/master.pb.h"
+#include "kudu/security/init.h"
 #include "kudu/util/cow_object.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/jsonwriter.h"
@@ -76,6 +78,35 @@ using strings::Substitute;
 
 namespace kudu {
 namespace master {
+
+// Helper function to map Kerberos principal to local username for REST API authorization
+static optional<string> MapPrincipalToLocalUser(const string& principal) {
+  if (principal.empty()) {
+    return "default";  // Use default username when no authentication is provided
+  }
+
+  // If the principal contains '@', it's likely a Kerberos principal that needs mapping
+  if (principal.find('@') != string::npos) {
+    string local_name;
+    Status s = kudu::security::MapPrincipalToLocalName(principal, &local_name);
+    if (s.ok()) {
+      // Validate that the mapping didn't produce an empty or suspicious username
+      if (local_name.empty() || local_name == principal) {
+        LOG(WARNING) << "Principal mapping produced invalid local name: " << principal << " -> "
+                     << local_name;
+        return std::nullopt;
+      }
+      VLOG(2) << "Mapped Kerberos principal " << principal << " to local user " << local_name;
+      return local_name;
+    }
+    LOG(WARNING) << "Failed to map Kerberos principal '" << principal
+                 << "' to local username: " << s.ToString()
+                 << ". REST API authorization will fail.";
+    return std::nullopt;
+  }
+  // If no '@' is found, treat it as a local username
+  return principal;
+}
 
 static bool CheckIsInitializedAndIsLeader(JsonWriter& jw,  // NOLINT JsonWriter cannot be const
                                           const CatalogManager::ScopedLeaderSharedLock& l,
@@ -224,9 +255,17 @@ void RestCatalogPathHandlers::HandleGetTables(std::ostringstream* output,
                                               HttpStatusCode* status_code) {
   ListTablesRequestPB request;
   ListTablesResponsePB response;
-  optional<string> user = req.authn_principal.empty() ? "default" : req.authn_principal;
-  Status status = master_->catalog_manager()->ListTables(&request, &response, user);
   JsonWriter jw(output, JsonWriter::COMPACT);
+
+  auto mapped_user = MapPrincipalToLocalUser(req.authn_principal);
+  if (!mapped_user.has_value()) {
+    RETURN_JSON_ERROR(jw,
+                      "Authentication principal could not be mapped to local user",
+                      *status_code,
+                      HttpStatusCode::Forbidden);
+  }
+  optional<string> user = mapped_user.value();
+  Status status = master_->catalog_manager()->ListTables(&request, &response, user);
 
   if (!status.ok()) {
     RETURN_JSON_ERROR_FROM_STATUS(jw, status, *status_code);
@@ -266,7 +305,14 @@ void RestCatalogPathHandlers::HandlePostTables(ostringstream* output,
                       *status_code,
                       HttpStatusCode::BadRequest);
   }
-  optional<string> user = req.authn_principal.empty() ? "default" : req.authn_principal;
+  auto mapped_user = MapPrincipalToLocalUser(req.authn_principal);
+  if (!mapped_user.has_value()) {
+    RETURN_JSON_ERROR(jw,
+                      "Authentication principal could not be mapped to local user",
+                      *status_code,
+                      HttpStatusCode::Forbidden);
+  }
+  optional<string> user = mapped_user.value();
   Status status = master_->catalog_manager()->CreateTableWithUser(&request, &response, user);
 
   if (!status.ok()) {
@@ -335,7 +381,14 @@ void RestCatalogPathHandlers::HandlePutTable(ostringstream* output,
                       HttpStatusCode::BadRequest);
   }
 
-  optional<string> user = req.authn_principal.empty() ? "default" : req.authn_principal;
+  auto mapped_user = MapPrincipalToLocalUser(req.authn_principal);
+  if (!mapped_user.has_value()) {
+    RETURN_JSON_ERROR(jw,
+                      "Authentication principal could not be mapped to local user",
+                      *status_code,
+                      HttpStatusCode::Forbidden);
+  }
+  optional<string> user = mapped_user.value();
   Status status = master_->catalog_manager()->AlterTableWithUser(request, &response, user);
 
   if (!status.ok()) {
@@ -383,7 +436,14 @@ void RestCatalogPathHandlers::HandleDeleteTable(ostringstream* output,
   DeleteTableResponsePB response;
   request.mutable_table()->set_table_id(table_id);
   JsonWriter jw(output, JsonWriter::COMPACT);
-  optional<string> user = req.authn_principal.empty() ? "default" : req.authn_principal;
+  auto mapped_user = MapPrincipalToLocalUser(req.authn_principal);
+  if (!mapped_user.has_value()) {
+    RETURN_JSON_ERROR(jw,
+                      "Authentication principal could not be mapped to local user",
+                      *status_code,
+                      HttpStatusCode::Forbidden);
+  }
+  optional<string> user = mapped_user.value();
   Status status = master_->catalog_manager()->DeleteTableWithUser(request, &response, user);
 
   if (status.ok()) {
