@@ -18,6 +18,7 @@
 #pragma once
 
 #include <iosfwd>
+#include <optional>
 #include <string>
 
 #include <glog/logging.h>
@@ -68,7 +69,8 @@ class RestCatalogPathHandlers final {
   // Print a JSON object representing a table to 'output'.
   void PrintTableObject(std::ostringstream* output,
                         const std::string& table_id,
-                        HttpStatusCode* status_code);
+                        HttpStatusCode* status_code,
+                        const std::optional<std::string>& user);
 
   Master* master_;
   DISALLOW_COPY_AND_ASSIGN(RestCatalogPathHandlers);

@@ -33,6 +33,7 @@
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/master/authz_provider.h"
 #include "kudu/master/catalog_manager.h"
 #include "kudu/master/master.h"
 #include "kudu/master/master.pb.h"
@@ -72,6 +73,7 @@ using std::optional;
 using std::ostringstream;
 using std::string;
 using std::vector;
+using std::nullopt;
 using strings::Substitute;
 
 namespace kudu {
@@ -294,7 +296,7 @@ void RestCatalogPathHandlers::HandlePostTables(ostringstream* output,
     }
 
     if (check_resp.done()) {
-      PrintTableObject(output, response.table_id(), status_code);
+      PrintTableObject(output, response.table_id(), status_code, nullopt);
       *status_code = HttpStatusCode::Created;
       return;
     }
@@ -310,7 +312,8 @@ void RestCatalogPathHandlers::HandleGetTable(ostringstream* output,
                                              const Webserver::WebRequest& req,
                                              HttpStatusCode* status_code) {
   string table_id = req.path_params.at("table_id");
-  PrintTableObject(output, table_id, status_code);
+  optional<string> user = req.username.empty() ? nullopt : make_optional(req.username);
+  PrintTableObject(output, table_id, status_code, user);
   *status_code = HttpStatusCode::Ok;
 }
 
@@ -363,7 +366,7 @@ void RestCatalogPathHandlers::HandlePutTable(ostringstream* output,
     }
 
     if (check_resp.done()) {
-      PrintTableObject(output, table_id, status_code);
+      PrintTableObject(output, table_id, status_code, nullopt);
       *status_code = HttpStatusCode::Ok;
       return;
     }
@@ -395,12 +398,29 @@ void RestCatalogPathHandlers::HandleDeleteTable(ostringstream* output,
 
 void RestCatalogPathHandlers::PrintTableObject(ostringstream* output,
                                                const string& table_id,
-                                               HttpStatusCode* status_code) {
+                                               HttpStatusCode* status_code,
+                                               const optional<string>& user) {
+  JsonWriter jw(output, JsonWriter::COMPACT);
   scoped_refptr<TableInfo> table;
   Status status = master_->catalog_manager()->GetTableInfo(table_id, &table);
-  JsonWriter jw(output, JsonWriter::COMPACT);
   if (!status.ok()) {
     RETURN_JSON_ERROR_FROM_STATUS(jw, status, *status_code);
+  }
+
+  if (!table) {
+    RETURN_JSON_ERROR(jw, "Table not found", *status_code, HttpStatusCode::NotFound);
+  }
+
+  // Check authorization if user is provided
+  if (user) {
+    TableMetadataLock l(table.get(), LockMode::READ);
+    Status authz_status = master_->catalog_manager()->authz_provider()->AuthorizeGetTableMetadata(
+        master_->catalog_manager()->NormalizeTableName(l.data().name()), 
+        *user, 
+        *user == l.data().owner());
+    if (!authz_status.ok()) {
+      RETURN_JSON_ERROR_FROM_STATUS(jw, authz_status, *status_code);
+    }
   }
 
   jw.StartObject();
