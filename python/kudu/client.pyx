@@ -937,6 +937,36 @@ cdef class TabletServer:
         return self._tserver.port()
 
 
+cdef class PartitionSchema:
+    """
+    Represents a Kudu table partition schema containing information about how
+    table rows are distributed among tablets.
+    """
+
+    def __init__(self):
+        """Initialize a PartitionSchema instance."""
+        self.table = None
+
+    def get_table_info(self):
+        """
+        Get basic table partition information.
+        
+        Returns
+        -------
+        info : dict
+            Dictionary containing basic partition information
+        """
+        if self.table is None:
+            return {'message': 'No table associated with this partition schema'}
+        
+        return {
+            'table_name': self.table.name,
+            'num_replicas': self.table.num_replicas,
+            'schema_num_columns': len(self.table.schema),
+            'message': 'Partition schema information accessed through table: ' + self.table.name
+        }
+
+
 cdef class Table:
 
     """
@@ -991,6 +1021,13 @@ cdef class Table:
         """Comment on the table."""
         def __get__(self):
             return frombytes(self.ptr().comment())
+
+    property partition_schema:
+        """Partition schema for the table."""
+        def __get__(self):
+            cdef PartitionSchema result = PartitionSchema()
+            result.table = self
+            return result
 
     def rename(self, new_name):
         raise NotImplementedError

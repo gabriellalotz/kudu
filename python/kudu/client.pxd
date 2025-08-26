@@ -73,6 +73,12 @@ cdef class Table:
         return self.table.get()
 
 
+cdef class PartitionSchema:
+
+    cdef:
+        object table  # Reference to the parent Table object
+
+
 cdef class TableAlterer:
 
     cdef:

@@ -845,3 +845,9 @@ cdef extern from "kudu/client/resource_metrics.h" namespace "kudu::client" nogil
 
         map[string, int64_t] Get()
         int64_t GetMetric(const string& name)
+
+cdef extern from "kudu/common/partial_row.h" namespace "kudu" nogil:
+    cdef cppclass Arena:
+        Arena(size_t initial_buffer_size)
+
+# Note: PartitionSchema info will be accessed through existing KuduTable methods
