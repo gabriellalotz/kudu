@@ -723,6 +723,75 @@ TEST_P(WebserverTest, TestPutMethodNotAllowed) {
   ASSERT_EQ("Remote error: HTTP 401", s.ToString());
 }
 
+static void UIPageHandler(const Webserver::WebRequest& req, Webserver::WebResponse* resp) {
+  resp->output["message"] = "UI page content";
+}
+
+static void APIEndpointHandler(const Webserver::WebRequest& req,
+                               Webserver::PrerenderedWebResponse* resp) {
+  resp->output << "API endpoint method: " << req.request_method;
+}
+
+class UIMethodRestrictionTest : public WebserverTest {
+ protected:
+  void SetUp() override {
+    WebserverTest::SetUp();
+    // Register a styled UI page (should be restricted to GET/HEAD)
+    server_->RegisterPathHandler("/ui-page", "UI Page", UIPageHandler, StyleMode::STYLED, true);
+    // Register a functional endpoint on nav bar (should accept all methods)
+    server_->RegisterPrerenderedPathHandler("/functional-page", "Functional", APIEndpointHandler, 
+                                           StyleMode::UNSTYLED, true);
+    // Register an API endpoint (should accept all methods)
+    server_->RegisterJsonPathHandler("/api-endpoint", "API", APIEndpointHandler, false);
+  }
+};
+
+INSTANTIATE_TEST_SUITE_P(Parameters, UIMethodRestrictionTest, testing::Values("ipv4", "dual"));
+
+TEST_P(UIMethodRestrictionTest, TestUIPageGetAllowed) {
+  ASSERT_OK(curl_.FetchURL(Substitute("$0/ui-page", url_), &buf_));
+  ASSERT_STR_CONTAINS(buf_.ToString(), "UI page content");
+}
+
+TEST_P(UIMethodRestrictionTest, TestUIPagePostNotAllowed) {
+  curl_.set_custom_method("POST");
+  Status s = curl_.FetchURL(Substitute("$0/ui-page", url_), &buf_);
+  ASSERT_EQ("Remote error: HTTP 405", s.ToString());
+  ASSERT_STR_CONTAINS(buf_.ToString(), "Method Not Allowed");
+}
+
+TEST_P(UIMethodRestrictionTest, TestUIPagePutNotAllowed) {
+  curl_.set_custom_method("PUT");
+  Status s = curl_.FetchURL(Substitute("$0/ui-page", url_), &buf_);
+  ASSERT_EQ("Remote error: HTTP 405", s.ToString());
+  ASSERT_STR_CONTAINS(buf_.ToString(), "Method Not Allowed");
+}
+
+TEST_P(UIMethodRestrictionTest, TestUIPageDeleteNotAllowed) {
+  curl_.set_custom_method("DELETE");
+  Status s = curl_.FetchURL(Substitute("$0/ui-page", url_), &buf_);
+  ASSERT_EQ("Remote error: HTTP 405", s.ToString());
+  ASSERT_STR_CONTAINS(buf_.ToString(), "Method Not Allowed");
+}
+
+TEST_P(UIMethodRestrictionTest, TestUIPageHeadAllowed) {
+  curl_.set_custom_method("HEAD");
+  ASSERT_OK(curl_.FetchURL(Substitute("$0/ui-page", url_), &buf_));
+  // HEAD should succeed (but with empty body)
+}
+
+TEST_P(UIMethodRestrictionTest, TestFunctionalPageAllowsAllMethods) {
+  // Test that functional pages (StyleMode::UNSTYLED) accept POST even if on nav bar
+  ASSERT_OK(curl_.PostToURL(Substitute("$0/functional-page", url_), "test data", &buf_));
+  ASSERT_STR_CONTAINS(buf_.ToString(), "API endpoint method: POST");
+}
+
+TEST_P(UIMethodRestrictionTest, TestAPIEndpointAllowsAllMethods) {
+  // Test that API endpoints (StyleMode::JSON) still accept POST
+  ASSERT_OK(curl_.PostToURL(Substitute("$0/api-endpoint", url_), "test data", &buf_));
+  ASSERT_STR_CONTAINS(buf_.ToString(), "API endpoint method: POST");
+}
+
 // Test that authenticated principal is correctly passed to the handler.
 static void Handler(const Webserver::WebRequest& req, Webserver::PrerenderedWebResponse* resp) {
   resp->output << req.username;

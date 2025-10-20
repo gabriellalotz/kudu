@@ -742,6 +742,16 @@ sq_callback_result_t Webserver::RunPathHandler(
     req.request_headers[key] = h.value;
   }
   req.request_method = request_info->request_method;
+
+  bool is_display_page = (handler.style_mode() == StyleMode::STYLED);
+  if (is_display_page && req.request_method != "GET" && req.request_method != "HEAD") {
+    resp->status_code = HttpStatusCode::MethodNotAllowed;
+    resp->response_headers["Allow"] = "GET, HEAD";
+    resp->output << "Method Not Allowed";
+    SendResponse(connection, resp);
+    return SQ_HANDLED_OK;
+  }
+
   if (req.request_method == "POST" || req.request_method == "PUT") {
     const char* content_len_str = sq_get_header(connection, "Content-Length");
     int32_t content_len = 0;
