@@ -77,6 +77,13 @@ cdef class Table:
         return self.table.get()
 
 
+cdef class TableStatistics:
+
+    cdef:
+        KuduTableStatistics* _statistics
+        public bint _own
+
+
 cdef class TableAlterer:
 
     cdef:

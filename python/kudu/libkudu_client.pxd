@@ -717,6 +717,15 @@ cdef extern from "kudu/client/client.h" namespace "kudu::client" nogil:
 
     Status DisableOpenSSLInitialization()
 
+    cdef cppclass KuduTableStatistics:
+        KuduTableStatistics()
+
+        int64_t on_disk_size()
+        int64_t live_row_count()
+        int64_t on_disk_size_limit()
+        int64_t live_row_count_limit()
+        string ToString()
+
     cdef cppclass KuduClient:
 
         Status DeleteTable(const string& table_name)
@@ -742,6 +751,9 @@ cdef extern from "kudu/client/client.h" namespace "kudu::client" nogil:
         Status ListTabletServers(vector[KuduTabletServer*]* tablet_servers)
 
         Status TableExists(const string& table_name, c_bool* exists)
+
+        Status GetTableStatistics(const string& table_name,
+                                  KuduTableStatistics** statistics)
 
         KuduTableAlterer* NewTableAlterer(const string& table_name)
         Status IsAlterTableInProgress(const string& table_name,

@@ -81,6 +81,26 @@ class TestClient(KuduTestBase, CompatUnitTest):
         self.assertFalse(self.client.table_exists('nonexistent-table'))
         self.assertTrue(self.client.table_exists(self.ex_table))
 
+    def test_get_table_statistics(self):
+        statistics = self.client.get_table_statistics(self.ex_table)
+        
+        # Check that statistics object is returned
+        self.assertIsNotNone(statistics)
+        
+        # Check that properties are accessible
+        # Note: on_disk_size and live_row_count might return -1 if not available
+        # but they should at least be integers
+        self.assertIsInstance(statistics.on_disk_size, (int, long))
+        self.assertIsInstance(statistics.live_row_count, (int, long))
+        self.assertIsInstance(statistics.on_disk_size_limit, (int, long))
+        self.assertIsInstance(statistics.live_row_count_limit, (int, long))
+        
+        # Check that __repr__ works
+        repr_str = repr(statistics)
+        self.assertIsInstance(repr_str, str)
+        self.assertIn("on disk size", repr_str)
+        self.assertIn("live row count", repr_str)
+
     def test_list_tables(self):
         schema = self.example_schema()
         partitioning = self.example_partitioning()
