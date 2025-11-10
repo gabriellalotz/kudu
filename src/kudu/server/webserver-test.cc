@@ -723,6 +723,77 @@ TEST_P(WebserverTest, TestPutMethodNotAllowed) {
   ASSERT_EQ("Remote error: HTTP 401", s.ToString());
 }
 
+// Handlers for testing HTTP method restrictions
+static void StyledPageHandler(const Webserver::WebRequest& /*req*/,
+                              Webserver::WebResponse* resp) {
+  resp->output["message"] = "Styled page content";
+}
+
+static void FunctionalEndpointHandler(const Webserver::WebRequest& req,
+                                     Webserver::PrerenderedWebResponse* resp) {
+  resp->output << "Endpoint method: " << req.request_method;
+}
+
+class HttpMethodRestrictionTest : public WebserverTest {
+ protected:
+  void SetUp() override {
+    WebserverTest::SetUp();
+    // Register a styled display page (should be restricted to GET/HEAD)
+    server_->RegisterPathHandler("/styled-page", "Styled", StyledPageHandler,
+                                StyleMode::STYLED, true);
+    // Register functional endpoints (should accept all methods)
+    server_->RegisterPrerenderedPathHandler("/functional", "Functional",
+                                           FunctionalEndpointHandler,
+                                           StyleMode::UNSTYLED, true);
+    server_->RegisterJsonPathHandler("/json", "JSON", FunctionalEndpointHandler, false);
+  }
+};
+
+INSTANTIATE_TEST_SUITE_P(Parameters, HttpMethodRestrictionTest,
+                         testing::Values("ipv4", "dual"));
+
+TEST_P(HttpMethodRestrictionTest, TestStyledPageAcceptsGet) {
+  ASSERT_OK(curl_.FetchURL(Substitute("$0/styled-page", url_), &buf_));
+  ASSERT_STR_CONTAINS(buf_.ToString(), "Styled page content");
+}
+
+TEST_P(HttpMethodRestrictionTest, TestStyledPageAcceptsHead) {
+  curl_.set_custom_method("HEAD");
+  ASSERT_OK(curl_.FetchURL(Substitute("$0/styled-page", url_), &buf_));
+}
+
+TEST_P(HttpMethodRestrictionTest, TestStyledPageRejectsPost) {
+  curl_.set_custom_method("POST");
+  Status s = curl_.FetchURL(Substitute("$0/styled-page", url_), &buf_);
+  ASSERT_EQ("Remote error: HTTP 405", s.ToString());
+  ASSERT_STR_CONTAINS(buf_.ToString(), "Method Not Allowed");
+}
+
+TEST_P(HttpMethodRestrictionTest, TestStyledPageRejectsPut) {
+  curl_.set_custom_method("PUT");
+  Status s = curl_.FetchURL(Substitute("$0/styled-page", url_), &buf_);
+  ASSERT_EQ("Remote error: HTTP 405", s.ToString());
+  ASSERT_STR_CONTAINS(buf_.ToString(), "Method Not Allowed");
+}
+
+TEST_P(HttpMethodRestrictionTest, TestStyledPageRejectsDelete) {
+  curl_.set_custom_method("DELETE");
+  Status s = curl_.FetchURL(Substitute("$0/styled-page", url_), &buf_);
+  ASSERT_EQ("Remote error: HTTP 405", s.ToString());
+  ASSERT_STR_CONTAINS(buf_.ToString(), "Method Not Allowed");
+}
+
+TEST_P(HttpMethodRestrictionTest, TestFunctionalEndpointAcceptsPost) {
+  // Verify functional endpoints (UNSTYLED) accept POST even if on nav bar
+  ASSERT_OK(curl_.PostToURL(Substitute("$0/functional", url_), "test", &buf_));
+  ASSERT_STR_CONTAINS(buf_.ToString(), "Endpoint method: POST");
+}
+
+TEST_P(HttpMethodRestrictionTest, TestJSONEndpointAcceptsPost) {
+  ASSERT_OK(curl_.PostToURL(Substitute("$0/json", url_), "test", &buf_));
+  ASSERT_STR_CONTAINS(buf_.ToString(), "Endpoint method: POST");
+}
+
 // Test that authenticated principal is correctly passed to the handler.
 static void Handler(const Webserver::WebRequest& req, Webserver::PrerenderedWebResponse* resp) {
   resp->output << req.username;
