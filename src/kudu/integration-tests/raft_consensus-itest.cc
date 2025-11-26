@@ -2132,7 +2132,11 @@ static void EnableLogLatency(server::GenericServiceProxy* proxy) {
 TEST_F(RaftConsensusITest, TestSlowLeader) {
   SKIP_IF_SLOW_NOT_ALLOWED();
 
-  NO_FATALS(BuildAndStart());
+  // Similar to TestSlowFollower, increase the tolerance for snapshot scans
+  // when WAL latency is high. The injected 1000ms mean latency can cause
+  // the safe timestamp to lag, making snapshot scans fail if the tolerance
+  // is too low.
+  NO_FATALS(BuildAndStart({"--missed_heartbeats_before_rejecting_snapshot_scans=3"}));
 
   TServerDetails* leader;
   ASSERT_OK(GetLeaderReplicaWithRetries(tablet_id_, &leader));
@@ -2141,6 +2145,12 @@ TEST_F(RaftConsensusITest, TestSlowLeader) {
   TestWorkload workload(cluster_.get());
   workload.set_table_name(kTableId);
   workload.set_num_read_threads(2);
+  // Reduce write pressure to prevent excessive safe time lag. With 1000ms
+  // injected WAL latency on the leader, multiple concurrent write threads
+  // create a backlog that causes safe time to fall far behind current time,
+  // eventually causing snapshot scans to timeout even with the increased
+  // missed_heartbeats_before_rejecting_snapshot_scans setting above.
+  workload.set_num_write_threads(1);
   workload.Setup();
   workload.Start();
   SleepFor(MonoDelta::FromSeconds(60));
