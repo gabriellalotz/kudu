@@ -335,8 +335,6 @@ Status AutoRebalancerTask::GetMovesUsingRebalancingAlgo(
   auto num_tservers = raw_info.tserver_summaries.size();
   auto max_moves = FLAGS_auto_rebalancing_max_moves_per_server * num_tservers;
   max_moves -= replica_moves->size();
-  // TODO(awong): it'd be nice to track the number of on-going moves for each
-  // tablet server and enforce the max moves at a more granular level.
   if (max_moves <= 0) {
     return Status::OK();
   }
@@ -357,7 +355,31 @@ Status AutoRebalancerTask::GetMovesUsingRebalancingAlgo(
 
   unordered_set<string> tablets_in_move;
   vector<Rebalancer::ReplicaMove> rep_moves;
+
+  // Make a copy of current per-tserver move counts to check against limits.
+  // We'll update this as we add moves in this batch.
+  unordered_map<string, int> tentative_moves_per_tserver = moves_per_tserver_;
+
   for (const auto& move : moves) {
+    // Check if this move would exceed the per-tserver limit.
+    // A move adds +1 to the source tserver and +1 to the destination tserver.
+    int src_count = tentative_moves_per_tserver[move.from];
+    int dst_count = tentative_moves_per_tserver[move.to];
+
+    if (src_count >= FLAGS_auto_rebalancing_max_moves_per_server ||
+        dst_count >= FLAGS_auto_rebalancing_max_moves_per_server) {
+      // Skip this move as it would violate per-tserver limits.
+      VLOG(1) << Substitute(
+          "Skipping move from $0 to $1: per-tserver limit reached "
+          "(src=$2, dst=$3, limit=$4)",
+          move.from,
+          move.to,
+          src_count,
+          dst_count,
+          FLAGS_auto_rebalancing_max_moves_per_server);
+      continue;
+    }
+
     vector<string> tablet_ids;
     rebalancer_.FindReplicas(move, raw_info, &tablet_ids);
     if (cross_location == CrossLocations::YES) {
@@ -369,9 +391,16 @@ Status AutoRebalancerTask::GetMovesUsingRebalancingAlgo(
           cluster_info.locality.location_by_ts_id, tpi, move, &tablet_ids));
     }
 
+    size_t rep_moves_before = rep_moves.size();
     RETURN_NOT_OK(SelectReplicaToMove(move, extra_info_by_tablet_id,
                                       &random_generator_, std::move(tablet_ids),
                                       &tablets_in_move, &rep_moves));
+
+    // If a move was actually added, update the tentative counts.
+    if (rep_moves.size() > rep_moves_before) {
+      tentative_moves_per_tserver[move.from]++;
+      tentative_moves_per_tserver[move.to]++;
+    }
   }
 
   *replica_moves = std::move(rep_moves);
@@ -408,8 +437,6 @@ Status AutoRebalancerTask::GetTabletLeader(
   return Status::NotFound(Substitute("Couldn't find leader for tablet $0", tablet_id));
 }
 
-// TODO(hannah.nguyen): remove moves that fail to be scheduled from
-// 'replica_moves'.
 Status AutoRebalancerTask::ExecuteMoves(
     const vector<Rebalancer::ReplicaMove>& replica_moves) {
   for (const auto& move_info : replica_moves) {
@@ -462,6 +489,21 @@ Status AutoRebalancerTask::ExecuteMoves(
     ConsensusServiceProxy proxy(messenger_, resolved[0], leader_hp.host());
     RETURN_NOT_OK(proxy.BulkChangeConfig(req, &resp, &rpc));
     if (resp.has_error()) return StatusFromPB(resp.error().status());
+
+    // Successfully scheduled the move. Increment counters for both source and destination.
+    moves_per_tserver_[src_ts_uuid]++;
+    if (!dst_ts_uuid.empty()) {
+      moves_per_tserver_[dst_ts_uuid]++;
+    }
+
+    VLOG(1) << Substitute(
+        "Scheduled move: tablet $0 from $1 to $2 "
+        "(src_moves=$3, dst_moves=$4)",
+        tablet_id,
+        src_ts_uuid,
+        dst_ts_uuid,
+        moves_per_tserver_[src_ts_uuid],
+        dst_ts_uuid.empty() ? 0 : moves_per_tserver_[dst_ts_uuid]);
   }
   return Status::OK();
 }
@@ -659,6 +701,17 @@ Status AutoRebalancerTask::CheckReplicaMovesCompleted(
     // the problematic one from 'replica_moves'.
     Status s = CheckMoveCompleted(move, &move_is_complete);
     if (!s.ok()) {
+      // Move failed. Decrement the per-tserver counters.
+      const auto& src_ts_uuid = move.ts_uuid_from;
+      const auto& dst_ts_uuid = move.ts_uuid_to;
+
+      if (moves_per_tserver_[src_ts_uuid] > 0) {
+        moves_per_tserver_[src_ts_uuid]--;
+      }
+      if (!dst_ts_uuid.empty() && moves_per_tserver_[dst_ts_uuid] > 0) {
+        moves_per_tserver_[dst_ts_uuid]--;
+      }
+
       replica_moves->erase(replica_moves->begin() + i);
       LOG(WARNING) << Substitute("Could not move replica: $0", s.ToString());
       return s;
@@ -669,8 +722,29 @@ Status AutoRebalancerTask::CheckReplicaMovesCompleted(
     }
   }
 
+  // For all completed moves, decrement the per-tserver counters and remove from list.
   int num_indexes = static_cast<int>(indexes_to_remove.size());
   for (int j = num_indexes - 1; j >= 0; --j) {
+    const auto& move = (*replica_moves)[indexes_to_remove[j]];
+    const auto& src_ts_uuid = move.ts_uuid_from;
+    const auto& dst_ts_uuid = move.ts_uuid_to;
+
+    if (moves_per_tserver_[src_ts_uuid] > 0) {
+      moves_per_tserver_[src_ts_uuid]--;
+    }
+    if (!dst_ts_uuid.empty() && moves_per_tserver_[dst_ts_uuid] > 0) {
+      moves_per_tserver_[dst_ts_uuid]--;
+    }
+
+    VLOG(1) << Substitute(
+        "Move completed: tablet $0 from $1 to $2 "
+        "(src_moves=$3, dst_moves=$4)",
+        move.tablet_uuid,
+        src_ts_uuid,
+        dst_ts_uuid,
+        moves_per_tserver_[src_ts_uuid],
+        dst_ts_uuid.empty() ? 0 : moves_per_tserver_[dst_ts_uuid]);
+
     replica_moves->erase(replica_moves->begin() + indexes_to_remove[j]);
   }
 

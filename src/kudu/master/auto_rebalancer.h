@@ -186,6 +186,10 @@ class AutoRebalancerTask {
   std::random_device random_device_;
   std::mt19937 random_generator_;
 
+  // Track the number of ongoing moves per tablet server (both source and destination).
+  // Key is the tserver UUID, value is the count of ongoing moves.
+  std::unordered_map<std::string, int> moves_per_tserver_;
+
   // Variables for testing.
   std::atomic<int> number_of_loop_iterations_for_test_;
   std::atomic<int> moves_scheduled_this_round_for_test_;
