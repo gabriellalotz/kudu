@@ -406,6 +406,9 @@ TEST_F(LeaderRebalancerTest, AddTserver) {
 
   cluster_opts_.num_tablet_servers = kNumTServers;
   FLAGS_leader_rebalancing_max_moves_per_round = 5;
+  // Disable automatic leader rebalancing thread so we can manually control it.
+  // Keep replica rebalancing enabled so replicas can distribute to the new tserver.
+  FLAGS_auto_leader_rebalancing_enabled = false;
   ASSERT_OK(CreateAndStartCluster());
 
   CreateWorkloadTable(kNumTablets, /*num_replicas*/ 3);
@@ -444,6 +447,8 @@ TEST_F(LeaderRebalancerTest, RestartTserver) {
   const int kNumTablets = 59;
   cluster_opts_.num_tablet_servers = kNumTServers;
   FLAGS_leader_rebalancing_max_moves_per_round = 5;
+  // Disable automatic leader rebalancing thread so we can manually control it.
+  FLAGS_auto_leader_rebalancing_enabled = false;
   ASSERT_OK(CreateAndStartCluster());
 
   CreateWorkloadTable(kNumTablets, /*num_replicas*/ 3);
@@ -477,6 +482,9 @@ TEST_F(LeaderRebalancerTest, TestMaintenanceMode) {
   constexpr const int kNumTablets = 10;
   cluster_opts_.num_tablet_servers = kNumTServers;
   FLAGS_leader_rebalancing_max_moves_per_round = 5;
+  // Disable automatic rebalancing threads to have predictable behavior.
+  FLAGS_auto_rebalancing_enabled = false;
+  FLAGS_auto_leader_rebalancing_enabled = false;
   ASSERT_OK(CreateAndStartCluster());
 
   CreateWorkloadTable(kNumTablets, /*num_replicas*/ 3);
@@ -484,8 +492,10 @@ TEST_F(LeaderRebalancerTest, TestMaintenanceMode) {
   // Leader master
   master::Master* master = cluster_->mini_master()->master();
 
+  master::AutoRebalancerTask* replica_rebalancer = master->catalog_manager()->auto_rebalancer();
   master::AutoLeaderRebalancerTask* leader_rebalancer =
       master->catalog_manager()->auto_leader_rebalancer();
+  ASSERT_NE(replica_rebalancer, nullptr);
   ASSERT_NE(leader_rebalancer, nullptr);
 
   constexpr const int kCurrentTserverIndex = 0;

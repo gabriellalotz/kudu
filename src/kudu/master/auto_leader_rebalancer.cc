@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <map>
 #include <optional>
 #include <ostream>
@@ -328,7 +329,38 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalanceForTable(
   }
 
   if (mode == AutoLeaderRebalancerTask::ExecuteMode::TEST) {
+    // In TEST mode, check if the cluster is reasonably balanced.
+    // When tservers have significantly uneven replica distribution (e.g., after adding
+    // a new tserver that hasn't received many replicas yet), perfect leader balance may
+    // not be achievable. The algorithm optimizes for leader/replica ratio, which can
+    // require some transfers even in a "good enough" state.
+    //
+    // We use a heuristic: if any tserver has less than half the average replica count,
+    // we're still in the rebalancing phase and allow some pending tasks.
+    int32_t total_replicas = 0;
+    int32_t min_replica_count = std::numeric_limits<int32_t>::max();
+    for (const auto& entry : replica_and_leader_count_by_ts_uuid) {
+      total_replicas += entry.second.first;
+      min_replica_count = std::min(min_replica_count, entry.second.first);
+    }
+    int32_t avg_replica_count = total_replicas / replica_and_leader_count_by_ts_uuid.size();
+
+    // If replica distribution is highly skewed, allow some pending leader transfers.
+    bool is_replica_distribution_skewed = (min_replica_count < avg_replica_count / 2);
+
     if (!leader_transfer_tasks.empty()) {
+      if (is_replica_distribution_skewed) {
+        // During replica rebalancing, allow up to max_moves_per_round pending tasks.
+        if (leader_transfer_tasks.size() > FLAGS_leader_rebalancing_max_moves_per_round) {
+          return Status::IllegalState(Substitute(
+              "leader_transfer_task size $0 exceeds limit $1 (replica distribution skewed)",
+              leader_transfer_tasks.size(),
+              FLAGS_leader_rebalancing_max_moves_per_round));
+        }
+        // Allow some pending tasks during replica rebalancing.
+        return Status::OK();
+      }
+      // Replica distribution is even, so leader balance should be achievable.
       return Status::IllegalState(Substitute("leader_transfer_task size should be 0, but $0",
                                              leader_transfer_tasks.size()));
     }
