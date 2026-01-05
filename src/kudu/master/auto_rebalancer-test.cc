@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -25,12 +26,16 @@
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include "kudu/client/client.h"
+#include "kudu/client/schema.h"
+#include "kudu/common/partial_row.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/join.h"
@@ -45,6 +50,9 @@
 #include "kudu/master/ts_descriptor.h"
 #include "kudu/master/ts_manager.h"
 #include "kudu/mini-cluster/internal_mini_cluster.h"
+#include "kudu/rebalance/cluster_status.h"
+#include "kudu/rebalance/rebalance_algo.h"
+#include "kudu/rebalance/rebalancer.h"
 #include "kudu/tserver/mini_tablet_server.h"
 #include "kudu/tserver/tablet_server.h"
 #include "kudu/util/logging_test_util.h"
@@ -59,8 +67,17 @@ using kudu::cluster::InternalMiniClusterOptions;
 using kudu::itest::GetTableLocations;
 using kudu::itest::ListTabletServers;
 using kudu::master::GetTableLocationsResponsePB;
+using kudu::client::KuduClient;
+using kudu::client::KuduColumnSchema;
+using kudu::client::KuduSchema;
+using kudu::client::KuduSchemaBuilder;
+using kudu::client::KuduTable;
+using kudu::client::KuduTableCreator;
+using kudu::client::sp::shared_ptr;
+using kudu::KuduPartialRow;
 using std::set;
 using std::string;
+using std::optional;
 using std::unique_ptr;
 using std::unordered_map;
 using std::unordered_set;
@@ -69,6 +86,8 @@ using strings::Substitute;
 
 DECLARE_bool(auto_leader_rebalancing_enabled);
 DECLARE_bool(auto_rebalancing_enabled);
+DECLARE_bool(auto_rebalancing_enable_range_rebalancing);
+DECLARE_bool(enable_minidumps);
 DECLARE_int32(consensus_inject_latency_ms_in_notifications);
 DECLARE_int32(follower_unavailable_considered_failed_sec);
 DECLARE_int32(raft_heartbeat_interval_ms);
@@ -218,6 +237,21 @@ class AutoRebalancerTest : public KuduTest {
     });
   }
 
+  static Status BuildClusterRawInfoForTest(
+      AutoRebalancerTask* auto_rebalancer,
+      const optional<string>& location,
+      rebalance::ClusterRawInfo* raw_info) {
+    return auto_rebalancer->BuildClusterRawInfo(location, raw_info);
+  }
+
+  static Status BuildClusterInfoForTest(
+      AutoRebalancerTask* auto_rebalancer,
+      const rebalance::ClusterRawInfo& raw_info,
+      rebalance::ClusterInfo* cluster_info) {
+    return auto_rebalancer->rebalancer_.BuildClusterInfo(
+        raw_info, rebalance::Rebalancer::MovesInProgress(), cluster_info);
+  }
+
   // Maps from tserver UUID to the bytes sent and fetched by each tserver as a
   // part of tablet copying.
   typedef unordered_map<string, int> MetricByUuid;
@@ -283,6 +317,13 @@ class AutoRebalancerTest : public KuduTest {
     if (cluster_) {
       cluster_->Shutdown();
     }
+    if (auto_rebalancing_enable_range_prev_) {
+      FLAGS_auto_rebalancing_enable_range_rebalancing =
+          *auto_rebalancing_enable_range_prev_;
+    }
+    if (enable_minidumps_prev_) {
+      FLAGS_enable_minidumps = *enable_minidumps_prev_;
+    }
     KuduTest::TearDown();
   }
 
@@ -290,6 +331,8 @@ class AutoRebalancerTest : public KuduTest {
     unique_ptr<InternalMiniCluster> cluster_;
     InternalMiniClusterOptions cluster_opts_;
     unique_ptr<TestWorkload> workload_;
+    optional<bool> auto_rebalancing_enable_range_prev_;
+    optional<bool> enable_minidumps_prev_;
   };
 
 // Make sure that only the leader master is doing auto-rebalancing
@@ -444,6 +487,107 @@ TEST_F(AutoRebalancerTest, NoReplicaMovesIfNoTablets) {
   ASSERT_OK(CreateAndStartCluster());
   NO_FATALS(CheckAutoRebalancerStarted());
   NO_FATALS(CheckNoMovesScheduled());
+}
+
+TEST_F(AutoRebalancerTest, RangeAwareBuildClusterInfoGroupsByRange) {
+  auto_rebalancing_enable_range_prev_ = FLAGS_auto_rebalancing_enable_range_rebalancing;
+  enable_minidumps_prev_ = FLAGS_enable_minidumps;
+  FLAGS_auto_rebalancing_enable_range_rebalancing = true;
+  // Avoid minidump handler thread teardown races in mini-cluster shutdown.
+  FLAGS_enable_minidumps = false;
+
+  cluster_opts_.num_tablet_servers = 3;
+  ASSERT_OK(CreateAndStartCluster());
+  NO_FATALS(CheckAutoRebalancerStarted());
+
+  shared_ptr<KuduClient> client;
+  ASSERT_OK(cluster_->CreateClient(nullptr, &client));
+
+  const string kTableName = "range_aware_auto_rebalancer_test";
+  KuduSchema schema;
+  KuduSchemaBuilder builder;
+  builder.AddColumn("key")->Type(KuduColumnSchema::INT32)->NotNull();
+  builder.SetPrimaryKey({ "key" });
+  ASSERT_OK(builder.Build(&schema));
+
+  unique_ptr<KuduPartialRow> lower0(schema.NewRow());
+  unique_ptr<KuduPartialRow> upper0(schema.NewRow());
+  ASSERT_OK(lower0->SetInt32("key", 0));
+  ASSERT_OK(upper0->SetInt32("key", 10));
+  unique_ptr<KuduPartialRow> lower1(schema.NewRow());
+  unique_ptr<KuduPartialRow> upper1(schema.NewRow());
+  ASSERT_OK(lower1->SetInt32("key", 10));
+  ASSERT_OK(upper1->SetInt32("key", 20));
+
+  unique_ptr<KuduTableCreator> table_creator(client->NewTableCreator());
+  ASSERT_OK(table_creator->table_name(kTableName)
+                .schema(&schema)
+                .add_hash_partitions({ "key" }, 2)
+                .set_range_partition_columns({ "key" })
+                .add_range_partition(lower0.release(), upper0.release())
+                .add_range_partition(lower1.release(), upper1.release())
+                .num_replicas(3)
+                .Create());
+
+  shared_ptr<KuduTable> table;
+  ASSERT_OK(client->OpenTable(kTableName, &table));
+  const string table_id = table->id();
+
+  int leader_idx;
+  ASSERT_OK(cluster_->GetLeaderMasterIndex(&leader_idx));
+  auto* auto_rebalancer =
+      cluster_->mini_master(leader_idx)->master()->catalog_manager()->auto_rebalancer();
+
+  rebalance::ClusterRawInfo raw_info;
+  ASSERT_OK(BuildClusterRawInfoForTest(auto_rebalancer, std::nullopt, &raw_info));
+
+  unordered_set<string> range_tags;
+  for (const auto& tablet : raw_info.tablet_summaries) {
+    if (tablet.table_id != table_id) {
+      continue;
+    }
+    ASSERT_FALSE(tablet.range_key_begin.empty());
+    range_tags.insert(tablet.range_key_begin);
+  }
+  ASSERT_EQ(2, range_tags.size());
+
+  rebalance::ClusterInfo cluster_info;
+  ASSERT_OK(BuildClusterInfoForTest(auto_rebalancer, raw_info, &cluster_info));
+  unordered_set<string> tags_in_balance;
+  for (const auto& elem : cluster_info.balance.table_info_by_skew) {
+    const auto& tbi = elem.second;
+    if (tbi.table_id == table_id) {
+      tags_in_balance.insert(tbi.tag);
+    }
+  }
+  ASSERT_EQ(range_tags, tags_in_balance);
+
+  FLAGS_auto_rebalancing_enable_range_rebalancing = false;
+  rebalance::ClusterRawInfo raw_info_no_range;
+  ASSERT_OK(BuildClusterRawInfoForTest(auto_rebalancer, std::nullopt, &raw_info_no_range));
+  int tablet_count = 0;
+  for (const auto& tablet : raw_info_no_range.tablet_summaries) {
+    if (tablet.table_id != table_id) {
+      continue;
+    }
+    ++tablet_count;
+    ASSERT_TRUE(tablet.range_key_begin.empty());
+  }
+  ASSERT_GT(tablet_count, 0);
+
+  rebalance::ClusterInfo cluster_info_no_range;
+  rebalance::Rebalancer local_rebalancer(rebalance::Rebalancer::Config{});
+  ASSERT_OK(local_rebalancer.BuildClusterInfo(
+      raw_info_no_range, rebalance::Rebalancer::MovesInProgress(), &cluster_info_no_range));
+  unordered_set<string> tags_no_range;
+  for (const auto& elem : cluster_info_no_range.balance.table_info_by_skew) {
+    const auto& tbi = elem.second;
+    if (tbi.table_id == table_id) {
+      tags_no_range.insert(tbi.tag);
+    }
+  }
+  ASSERT_EQ(1, tags_no_range.size());
+  ASSERT_TRUE(ContainsKey(tags_no_range, ""));
 }
 
 // Assign each tserver to its own location.
