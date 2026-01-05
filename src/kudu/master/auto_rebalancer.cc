@@ -17,10 +17,11 @@
 
 #include "kudu/master/auto_rebalancer.h"
 
-#include <cstdint>
-
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
+#include <iomanip>
 #include <memory>
 #include <optional>
 #include <ostream>
@@ -36,11 +37,13 @@
 #include <glog/logging.h>
 
 #include "kudu/common/common.pb.h"
+#include "kudu/common/partition.h"
 #include "kudu/common/wire_protocol.h"
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/consensus/consensus.pb.h"
 #include "kudu/consensus/consensus.proxy.h"
 #include "kudu/consensus/metadata.pb.h"
+#include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -57,6 +60,7 @@
 #include "kudu/security/init.h"
 #include "kudu/tserver/tserver.pb.h"
 #include "kudu/util/cow_object.h"
+#include "kudu/util/flag_tags.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
@@ -139,6 +143,14 @@ DEFINE_uint32(auto_rebalancing_wait_for_replica_moves_seconds, 1,
               "How long to wait before checking to see if the scheduled replica movement "
               "in this iteration of auto-rebalancing has completed.");
 
+DEFINE_bool(auto_rebalancing_enable_range_rebalancing, true,
+            "Whether to rebalance each range partition independently. "
+            "When enabled, the auto-rebalancer treats each range partition "
+            "as a separate entity for balancing purposes, allowing finer-grained "
+            "control over replica distribution across tablet servers.");
+TAG_FLAG(auto_rebalancing_enable_range_rebalancing, advanced);
+TAG_FLAG(auto_rebalancing_enable_range_rebalancing, runtime);
+
 DECLARE_bool(auto_rebalancing_enabled);
 
 namespace kudu {
@@ -164,7 +176,9 @@ AutoRebalancerTask::AutoRebalancerTask(CatalogManager* catalog_manager,
       /*run_cross_location_rebalancing*/true,
       /*run_intra_location_rebalancing*/true,
       FLAGS_auto_rebalancing_load_imbalance_threshold,
-      /*force_rebalance_replicas_on_maintenance_tservers*/false))),
+      /*force_rebalance_replicas_on_maintenance_tservers*/false,
+      /*intra_location_rebalancing_concurrency*/0,
+      FLAGS_auto_rebalancing_enable_range_rebalancing))),
       random_generator_(random_device_()),
       number_of_loop_iterations_for_test_(0),
       moves_scheduled_this_round_for_test_(0) {
@@ -582,6 +596,26 @@ Status AutoRebalancerTask::BuildClusterRawInfo(
       tablet_summary.id = tablet->id();
       tablet_summary.table_id = table_summary.id;
       tablet_summary.table_name = table_summary.name;
+
+      // Extract range partition key for range-aware rebalancing
+      if (FLAGS_auto_rebalancing_enable_range_rebalancing) {
+        const auto& tablet_pb = tablet_l.data().pb;
+        if (tablet_pb.has_partition()) {
+          Partition partition;
+          Partition::FromPB(tablet_pb.partition(), &partition);
+          const auto& range_key_begin = partition.begin().range_key();
+
+          // Format as hex string for consistency with ksck
+          std::ostringstream ss_range_key_begin;
+          for (size_t i = 0; i < range_key_begin.size(); ++i) {
+            ss_range_key_begin << std::hex << std::setw(2) << std::setfill('0')
+                               << static_cast<uint16_t>(static_cast<uint8_t>(range_key_begin[i]));
+          }
+          tablet_summary.range_key_begin = ss_range_key_begin.str();
+          VLOG(2) << Substitute("Tablet $0 range_key_begin: $1",
+                                tablet_summary.id, tablet_summary.range_key_begin);
+        }
+      }
 
       // Retrieve all replicas of the tablet.
       vector<ReplicaSummary> replicas;
