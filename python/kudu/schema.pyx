@@ -729,12 +729,15 @@ cdef class SchemaBuilder:
         Parameters
         ----------
         colschema : ColumnSchema
+            The column schema to copy
 
         Examples
         --------
-        for col in scanner.get_projection_schema():
-            builder.copy_column(col).compression('lz4')
-        builder.set_primary_keys(['key'])
+        ::
+
+            for col in scanner.get_projection_schema():
+                builder.copy_column(col).compression('lz4')
+            builder.set_primary_keys(['key'])
 
         Returns
         -------
