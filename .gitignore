@@ -57,6 +57,7 @@ www/tracing.*
 # Python
 python/kudu/*.so
 python/kudu/*.cpp
+python/docs/_build/
 *.py[ocd]
 .env
 .venv

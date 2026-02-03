@@ -32,13 +32,15 @@ RELEASE_OUTPUT_DIR="$SITE_OUTPUT_DIR/releases/$VERSION"
 
 OPT_DOXYGEN=1 # By default, build doxygen docs.
 OPT_JAVADOC=1 # By default, build javadocs.
+OPT_PYTHON_DOC=1 # By default, build Python API docs.
 OPT_LINK=1 # By default, update the top level symbolic links.
 OPT_FORCE='' # By default, don't overwrite the destination directory.
 
 usage() {
-  echo "Usage: $0 [--no-doxygen] [--no-javadoc] [--force]"
+  echo "Usage: $0 [--no-doxygen] [--no-javadoc] [--no-python-doc] [--force]"
   echo "Specify --no-doxygen to skip generation of the C++ client API docs"
   echo "Specify --no-javadoc to skip generation of the Java API docs"
+  echo "Specify --no-python-doc to skip generation of the Python client API docs"
   echo "Specify --no-link to skip updating the top level symbolic links"
   echo "Specify --force to overwrite the destination directory, if it exists"
   exit 1
@@ -47,13 +49,14 @@ usage() {
 if [ $# -gt 0 ]; then
   for arg in $*; do
     case $arg in
-      "--no-doxygen")  OPT_DOXYGEN='' ;;
-      "--no-javadoc")  OPT_JAVADOC='' ;;
-      "--no-link")     OPT_LINK='' ;;
-      "--force")       OPT_FORCE=1 ;;
-      "--help")        usage ;;
-      "-h")            usage ;;
-      *)               echo "$0: Unknown command-line option: $arg"; usage ;;
+      "--no-doxygen")     OPT_DOXYGEN='' ;;
+      "--no-javadoc")     OPT_JAVADOC='' ;;
+      "--no-python-doc")  OPT_PYTHON_DOC='' ;;
+      "--no-link")        OPT_LINK='' ;;
+      "--force")          OPT_FORCE=1 ;;
+      "--help")           usage ;;
+      "-h")               usage ;;
+      *)                  echo "$0: Unknown command-line option: $arg"; usage ;;
     esac
   done
 fi
@@ -170,6 +173,43 @@ if [ -n "$OPT_DOXYGEN" ]; then
     rm "$SITE_OUTPUT_DIR/$CPP_CLIENT_API_SUBDIR"
     ln -s "$RELEASE_SUBDIR/$CPP_CLIENT_API_SUBDIR" "$SITE_OUTPUT_DIR/$CPP_CLIENT_API_SUBDIR"
   fi
+fi
+
+if [ -n "$OPT_PYTHON_DOC" ]; then
+  PYTHON_CLIENT_API_SUBDIR="python-client-api"
+  
+  echo "Building Python client API documentation..."
+  cd "$SOURCE_ROOT/python"
+  
+  # Build the Python module if not already built
+  if ! python3 -c "import kudu.client" 2>/dev/null; then
+    echo "Building Python module..."
+    python3 setup.py build_ext --inplace
+  fi
+  
+  # Install Sphinx if needed
+  if ! python3 -c "import sphinx" 2>/dev/null; then
+    echo "Installing Sphinx..."
+    pip3 install --user sphinx
+  fi
+  
+  # Build the documentation
+  cd "$SOURCE_ROOT/python/docs"
+  export PATH="$HOME/.local/bin:$PATH"
+  rm -rf _build
+  sphinx-build -b html . _build/html
+  
+  # Copy to release output
+  rm -Rf "$RELEASE_OUTPUT_DIR/$PYTHON_CLIENT_API_SUBDIR"
+  cp -a "$SOURCE_ROOT/python/docs/_build/html" "$RELEASE_OUTPUT_DIR/$PYTHON_CLIENT_API_SUBDIR"
+  
+  if [ -n "$OPT_LINK" ]; then
+    # Update the top level python-client-api symbolic link.
+    rm -f "$SITE_OUTPUT_DIR/$PYTHON_CLIENT_API_SUBDIR"
+    ln -s "$RELEASE_SUBDIR/$PYTHON_CLIENT_API_SUBDIR" "$SITE_OUTPUT_DIR/$PYTHON_CLIENT_API_SUBDIR"
+  fi
+  
+  echo "Python client API documentation built successfully."
 fi
 
 # Generate the release index file.

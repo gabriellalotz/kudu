@@ -1617,17 +1617,18 @@ cdef class Session:
 
         The effect of the buffer size varies based on the flush mode of the session:
 
-            AUTO_FLUSH_SYNC: since no buffering is done, this has no effect.
-            AUTO_FLUSH_BACKGROUND: if the buffer space is exhausted, then write calls
-                will block until there is space available in the buffer.
-            MANUAL_FLUSH: if the buffer space is exhausted, then write calls will return
-                an error
+        - AUTO_FLUSH_SYNC: since no buffering is done, this has no effect.
+        - AUTO_FLUSH_BACKGROUND: if the buffer space is exhausted, then write calls
+          will block until there is space available in the buffer.
+        - MANUAL_FLUSH: if the buffer space is exhausted, then write calls will return
+          an error
 
         By default, the buffer space is set to 7 MiB (i.e. 7 * 1024 * 1024 bytes).
 
         Parameters
         ----------
-        size_bytes : Size of the buffer space to set (number of bytes)
+        size_bytes : int
+            Size of the buffer space to set (number of bytes)
         """
         status = self.s.get().SetMutationBufferSpace(size_bytes)
 

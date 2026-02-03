@@ -16,6 +16,12 @@
 # under the License.
 
 class KuduException(Exception):
+    """
+    Base exception class for all Kudu-related errors.
+    
+    All Kudu Python client exceptions inherit from this class,
+    allowing you to catch all Kudu errors with a single except clause.
+    """
     pass
 
 
@@ -27,22 +33,52 @@ class KuduBadStatus(KuduException):
 
 
 class KuduNotFound(KuduBadStatus):
+    """
+    Exception raised when a requested resource (table, tablet, etc.) is not found.
+    
+    This typically occurs when trying to access a table that doesn't exist
+    or a tablet that has been deleted.
+    """
     pass
 
 
 class KuduNotSupported(KuduBadStatus):
+    """
+    Exception raised when an operation is not supported.
+    
+    This can occur when attempting to use a feature that is not available
+    in the current version of Kudu or with the current configuration.
+    """
     pass
 
 
 class KuduInvalidArgument(KuduBadStatus):
+    """
+    Exception raised when an invalid argument is provided to an operation.
+    
+    This typically occurs when providing invalid column names, types,
+    or values that don't match the schema constraints.
+    """
     pass
 
 
 class KuduNotAuthorized(KuduBadStatus):
+    """
+    Exception raised when the client is not authorized to perform an operation.
+    
+    This occurs when authentication is enabled and the client lacks
+    the necessary permissions for the requested operation.
+    """
     pass
 
 
 class KuduAborted(KuduBadStatus):
+    """
+    Exception raised when an operation is aborted.
+    
+    This can occur during tablet leadership changes or when an
+    operation times out or is explicitly cancelled.
+    """
     pass
 
 
