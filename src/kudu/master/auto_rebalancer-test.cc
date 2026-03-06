@@ -104,6 +104,7 @@ using std::vector;
 using strings::Substitute;
 
 DECLARE_bool(auto_leader_rebalancing_enabled);
+DECLARE_bool(auto_rebalancing_avoid_leader_moves);
 DECLARE_bool(auto_rebalancing_enabled);
 DECLARE_bool(auto_rebalancing_enable_range_rebalancing);
 DECLARE_bool(auto_rebalancing_fail_moves_for_test);
@@ -1171,6 +1172,36 @@ TEST_F(AutoRebalancerTest, TestRemoveReplaceFlagIfMoveFails) {
       }
     }
   });
+}
+
+// Verify that the auto-rebalancer schedules replica moves regardless of the
+// value of --auto_rebalancing_avoid_leader_moves. The flag controls whether
+// the algorithm prefers non-leader moves among equal candidates, not whether
+// rebalancing happens at all.
+TEST_F(AutoRebalancerTest, TestRebalancingAvoidsLeaderMoves) {
+  const bool original_avoid = FLAGS_auto_rebalancing_avoid_leader_moves;
+  SCOPED_CLEANUP({ FLAGS_auto_rebalancing_avoid_leader_moves = original_avoid; });
+
+  const int kNumOrigTservers = 3;
+  const int kNumTablets = 6;
+
+  cluster_opts_.num_tablet_servers = kNumOrigTservers;
+  ASSERT_OK(CreateAndStartCluster(/*enable_leader_rebalance=*/false));
+  NO_FATALS(CheckAutoRebalancerStarted());
+
+  CreateWorkloadTable(kNumTablets, /*num_replicas*/3);
+  workload_->Start();
+  while (workload_->rows_inserted() < 500) {
+    SleepFor(MonoDelta::FromMilliseconds(100));
+  }
+  workload_->StopAndJoin();
+
+  ASSERT_OK(cluster_->AddTabletServer());
+
+  // With avoid_leader_moves=true (default), replica moves are still scheduled.
+  FLAGS_auto_rebalancing_avoid_leader_moves = true;
+  NO_FATALS(CheckSomeMovesScheduled());
+  NO_FATALS(CheckNoLeaderMovesScheduled());
 }
 
 } // namespace master

@@ -25,6 +25,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <gtest/gtest_prod.h>
@@ -113,6 +114,15 @@ struct ClusterInfo {
 
   // Locality information for a cluster.
   ClusterLocalityInfo locality;
+
+  // For each {table, tag} group, the set of tserver UUIDs that host at least
+  // one non-leader replica in that group. Used by the rebalancing algorithm to
+  // prefer moves where the source replica is a follower, since moving a leader
+  // triggers a leadership transfer and can disrupt active clients. Absence of
+  // a key means all replicas in that {table, tag} group are leaders.
+  std::unordered_map<TableIdAndTag, std::unordered_set<std::string>,
+                     TableIdAndTagHash, TableIdAndTagEqual>
+      ts_with_followers_by_table_and_tag;
 };
 
 // A directive to move some replica of a table between two tablet servers.
@@ -182,7 +192,8 @@ class TwoDimensionalGreedyAlgo : public RebalancingAlgo {
     PICK_RANDOM,
   };
   explicit TwoDimensionalGreedyAlgo(
-      EqualSkewOption opt = EqualSkewOption::PICK_RANDOM);
+      EqualSkewOption opt = EqualSkewOption::PICK_RANDOM,
+      bool prefer_follower_moves = true);
 
  protected:
   Status GetNextMove(const ClusterInfo& cluster_info,
@@ -231,6 +242,7 @@ class TwoDimensionalGreedyAlgo : public RebalancingAlgo {
       std::vector<std::string>* server_uuids);
 
   const EqualSkewOption equal_skew_opt_;
+  const bool prefer_follower_moves_;
   std::random_device random_device_;
   std::mt19937 generator_;
 };
