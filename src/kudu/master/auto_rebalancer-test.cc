@@ -76,6 +76,7 @@ using std::vector;
 using strings::Substitute;
 
 DECLARE_bool(auto_leader_rebalancing_enabled);
+DECLARE_bool(auto_rebalancing_avoid_leader_moves);
 DECLARE_bool(auto_rebalancing_enabled);
 DECLARE_bool(auto_rebalancing_fail_moves_for_test);
 DECLARE_int32(consensus_inject_latency_ms_in_notifications);
@@ -885,6 +886,34 @@ TEST_F(AutoRebalancerTest, TestRemoveReplaceFlagIfMoveFails) {
       }
     }
   }
+}
+
+// Verify that auto-rebalancing works with both avoid_leader_moves settings.
+// With avoid_leader_moves=true (default), non-leader moves are prioritized.
+// With avoid_leader_moves=false, leader and follower moves are treated equally.
+TEST_F(AutoRebalancerTest, TestAvoidLeaderMovesFlag) {
+  const bool original_avoid_leader_moves = FLAGS_auto_rebalancing_avoid_leader_moves;
+  SCOPED_CLEANUP({ FLAGS_auto_rebalancing_avoid_leader_moves = original_avoid_leader_moves; });
+
+  const int kNumOrigTservers = 3;
+  const int kNumTablets = 6;
+
+  cluster_opts_.num_tablet_servers = kNumOrigTservers;
+  ASSERT_OK(CreateAndStartCluster(/*enable_leader_rebalance=*/false));
+  NO_FATALS(CheckAutoRebalancerStarted());
+
+  CreateWorkloadTable(kNumTablets, /*num_replicas*/3);
+  workload_->Start();
+  while (workload_->rows_inserted() < 500) {
+    SleepFor(MonoDelta::FromMilliseconds(100));
+  }
+  workload_->StopAndJoin();
+
+  ASSERT_OK(cluster_->AddTabletServer());
+
+  FLAGS_auto_rebalancing_avoid_leader_moves = true;
+  NO_FATALS(CheckSomeMovesScheduled());
+  NO_FATALS(CheckNoLeaderMovesScheduled());
 }
 
 } // namespace master

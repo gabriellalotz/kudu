@@ -147,11 +147,67 @@ DEFINE_bool(auto_rebalancing_fail_moves_for_test, false,
             "This is only used for test.");
 TAG_FLAG(auto_rebalancing_fail_moves_for_test, unsafe);
 
+DEFINE_bool(auto_rebalancing_avoid_leader_moves, true,
+            "When true, the auto-rebalancer prioritizes moving follower replicas over "
+            "leader replicas. Leader moves are only scheduled when there are no "
+            "sufficient non-leader moves to balance the cluster. This reduces "
+            "disruption to ongoing workloads since moving a leader triggers a "
+            "leadership transfer. When false, leader and follower replicas are "
+            "treated equally.");
+
 DECLARE_bool(auto_rebalancing_enabled);
 
 namespace kudu {
 
 namespace master {
+
+namespace {
+
+void BuildTabletLeaderMap(const ClusterRawInfo& raw_info,
+                         unordered_map<string, string>* tablet_to_leader) {
+  for (const auto& tablet_summary : raw_info.tablet_summaries) {
+    for (const auto& replica : tablet_summary.replicas) {
+      if (replica.is_leader) {
+        (*tablet_to_leader)[tablet_summary.id] = replica.ts_uuid;
+        break;
+      }
+    }
+  }
+}
+
+void PrioritizeMovesAvoidingLeaders(
+    const unordered_map<string, string>& tablet_to_leader,
+    vector<Rebalancer::ReplicaMove>* replica_moves) {
+  if (!FLAGS_auto_rebalancing_avoid_leader_moves || replica_moves->empty()) {
+    return;
+  }
+  vector<Rebalancer::ReplicaMove> non_leader_moves;
+  vector<Rebalancer::ReplicaMove> leader_moves;
+  non_leader_moves.reserve(replica_moves->size());
+  leader_moves.reserve(replica_moves->size());
+
+  for (auto& move : *replica_moves) {
+    const auto it = tablet_to_leader.find(move.tablet_uuid);
+    const bool is_leader_move = it != tablet_to_leader.end() &&
+                               it->second == move.ts_uuid_from;
+    if (is_leader_move) {
+      leader_moves.push_back(std::move(move));
+    } else {
+      non_leader_moves.push_back(std::move(move));
+    }
+  }
+
+  replica_moves->clear();
+  replica_moves->reserve(non_leader_moves.size() + leader_moves.size());
+  for (auto& m : non_leader_moves) {
+    replica_moves->push_back(std::move(m));
+  }
+  for (auto& m : leader_moves) {
+    replica_moves->push_back(std::move(m));
+  }
+}
+
+}  // anonymous namespace
 
 AutoRebalancerTask::AutoRebalancerTask(CatalogManager* catalog_manager,
                                        TSManager* ts_manager)
@@ -302,6 +358,9 @@ Status AutoRebalancerTask::GetMoves(
   if (ts_id_by_location.size() == 1) {
     rebalance::TwoDimensionalGreedyAlgo algo;
     RETURN_NOT_OK(GetMovesUsingRebalancingAlgo(raw_info, &algo, CrossLocations::NO, &rep_moves));
+    unordered_map<string, string> tablet_to_leader;
+    BuildTabletLeaderMap(raw_info, &tablet_to_leader);
+    PrioritizeMovesAvoidingLeaders(tablet_to_leader, &rep_moves);
     *replica_moves = std::move(rep_moves);
     return Status::OK();
   }
@@ -316,6 +375,9 @@ Status AutoRebalancerTask::GetMoves(
     RETURN_NOT_OK(FindMovesToReimposePlacementPolicy(
         placement_info, locality, ppvi, &rep_moves));
     if (!rep_moves.empty()) {
+      unordered_map<string, string> tablet_to_leader;
+      BuildTabletLeaderMap(raw_info, &tablet_to_leader);
+      PrioritizeMovesAvoidingLeaders(tablet_to_leader, &rep_moves);
       *replica_moves = std::move(rep_moves);
       return Status::OK();
     }
@@ -340,6 +402,9 @@ Status AutoRebalancerTask::GetMoves(
           location_raw_info, &algo, CrossLocations::NO, &rep_moves));
     }
   }
+  unordered_map<string, string> tablet_to_leader;
+  BuildTabletLeaderMap(raw_info, &tablet_to_leader);
+  PrioritizeMovesAvoidingLeaders(tablet_to_leader, &rep_moves);
   *replica_moves = std::move(rep_moves);
   return Status::OK();
 }
