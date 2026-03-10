@@ -1019,7 +1019,7 @@ HealthCheckResult Ksck::VerifyTablet(const shared_ptr<KsckTablet>& tablet,
   ostringstream ss_range_key_begin;
   for (size_t i = 0; i < range_key_begin.size(); ++i) {
     ss_range_key_begin << std::hex << std::setw(2) << std::setfill('0')
-                       << static_cast<uint16_t>(range_key_begin[i]);
+                       << static_cast<uint16_t>(static_cast<uint8_t>(range_key_begin[i]));
   }
   tablet_summary.range_key_begin = ss_range_key_begin.str();
   VLOG(1) << Substitute("range start key for tablet $0: '$1'",
