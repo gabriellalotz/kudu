@@ -136,6 +136,7 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalanceForTable(
     const scoped_refptr<TableInfo>& table_info,
     const vector<string>& tserver_uuids,
     const unordered_set<string>& exclude_dest_uuids,
+    std::unordered_map<string, int>* global_leader_count,
     AutoLeaderRebalancerTask::ExecuteMode mode) {
   LOG(INFO) << Substitute("leader rebalance for table $0", table_info->table_name());
   TableMetadataLock table_l(table_info.get(), LockMode::READ);
@@ -210,6 +211,12 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalanceForTable(
     }
   }
 
+  if (global_leader_count) {
+    for (const auto& [uuid, tablet_ids] : leader_tablet_ids_by_ts_uuid) {
+      (*global_leader_count)[uuid] += static_cast<int>(tablet_ids.size());
+    }
+  }
+
   // step 2.
   // pick the servers which number of leaders greater than 1/3 of number of all replicas
   // <uuid, number of replica, number of leader>
@@ -276,6 +283,7 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalanceForTable(
         continue;
       }
       double min_score = 1;
+      int min_global_count = 0;
       for (int j = 0; j < uuid_followers.size(); j++) {
         if (ContainsKey(exclude_dest_uuids, uuid_followers[j])) {
           continue;
@@ -290,8 +298,11 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalanceForTable(
         int32_t leader_count = replica_and_leader_count.second;
         // double is not precise.
         double score = static_cast<double>(leader_count) / replica_count;
-        if (score < min_score) {
+        int global_count = global_leader_count
+            ? FindWithDefault(*global_leader_count, uuid_followers[j], 0) : 0;
+        if (score < min_score || (score == min_score && global_count < min_global_count)) {
           min_score = score;
+          min_global_count = global_count;
           dest_follower_uuid = uuid_followers[j];
         }
       }
@@ -312,6 +323,10 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalanceForTable(
           {tablet_id, std::pair<string, string>(leader_uuid, dest_follower_uuid)});
       replica_and_leader_count_by_ts_uuid[leader_uuid].second--;
       replica_and_leader_count_by_ts_uuid[dest_follower_uuid].second++;
+      if (global_leader_count) {
+        (*global_leader_count)[leader_uuid]--;
+        (*global_leader_count)[dest_follower_uuid]++;
+      }
       if (leader_transfer_tasks.size() >= FLAGS_leader_rebalancing_max_moves_per_round) {
         break;
       }
@@ -442,9 +457,18 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalancer() {
       catalog_manager_->GetAllTables(&table_infos);
     }
   }
+
+  // Seed the global map with 0 for every live tserver. As each table is processed, actual
+  // leader counts are accumulated and planned moves adjust the values, so later tables benefit
+  // from a cross-table view when breaking destination-scoring ties.
+  std::unordered_map<string, int> global_leader_count_by_ts_uuid;
+  for (const auto& uuid : tserver_uuids) {
+    global_leader_count_by_ts_uuid[uuid] = 0;
+  }
+
   for (const auto& table_info : table_infos) {
     RETURN_NOT_OK(RunLeaderRebalanceForTable(
-        table_info, tserver_uuids, exclude_dest_uuids));
+        table_info, tserver_uuids, exclude_dest_uuids, &global_leader_count_by_ts_uuid));
   }
   // @TODO(duyuqi)
   // Enrich the log and add metrics for leader rebalancer.

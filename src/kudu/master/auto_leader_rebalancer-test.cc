@@ -140,7 +140,7 @@ class LeaderRebalancerTest : public KuduTest {
     }
 
     return catalog_manager->auto_leader_rebalancer()->RunLeaderRebalanceForTable(
-        table_info, tserver_uuids, {}, AutoLeaderRebalancerTask::ExecuteMode::TEST);
+        table_info, tserver_uuids, {}, nullptr, AutoLeaderRebalancerTask::ExecuteMode::TEST);
   }
 
   // Get the leader numbers of each tablet server.
