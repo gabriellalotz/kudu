@@ -17,6 +17,7 @@
 #include "kudu/master/auto_leader_rebalancer.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <functional>
@@ -25,6 +26,7 @@
 #include <memory>
 #include <numeric>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -263,6 +265,103 @@ class LeaderRebalancerTest : public KuduTest {
       tmp_distribution++;
     }
     return Status::OK();
+  }
+
+  // Creates 'num_tables' single-tablet RF=3 tables (named '<table_prefix><i>')
+  // and forces every leader onto ts0, so all leaders pile up on a single
+  // tserver. Each single-tablet table is balanced on its own (one leader equals
+  // the per-table target), so only the global pass can fix the cross-table skew.
+  // Appends the created table names to 'table_names'.
+  void CreateSingleTabletTablesOnTs0(int num_tables,
+                                     const string& table_prefix,
+                                     std::vector<string>* table_names) {
+    const int num_tservers = cluster_->num_tablet_servers();
+    for (int i = 0; i < num_tables; i++) {
+      const string name = strings::Substitute("$0$1", table_prefix, i);
+      table_names->emplace_back(name);
+      workload_.reset(new TestWorkload(cluster_.get()));
+      workload_->set_table_name(name);
+      workload_->set_num_tablets(1);
+      workload_->set_num_replicas(3);
+      workload_->Setup();
+      std::vector<int32_t> leader_distribution(num_tservers, 0);
+      leader_distribution[0] = 1;
+      ASSERT_OK(MakeLeaderDistribution(leader_distribution, name));
+    }
+  }
+
+  // Number of leader transfers the last rebalancer round scheduled.
+  int MovesScheduledLastRound() {
+    return cluster_->mini_master()->master()->catalog_manager()
+        ->auto_leader_rebalancer()->moves_scheduled_this_round_for_test_.load();
+  }
+
+  // Sums each tserver's leader count across all of 'table_names'.
+  Status GlobalLeaderDistribution(const std::vector<string>& table_names,
+                                  std::map<string, int32_t>* totals) {
+    totals->clear();
+    for (const auto& name : table_names) {
+      std::map<string, int32_t> dist;
+      RETURN_NOT_OK(GetLeaderDistribution(&dist, name));
+      for (const auto& [uuid, count] : dist) {
+        (*totals)[uuid] += count;
+      }
+    }
+    return Status::OK();
+  }
+
+  // Creates 'num_tables' single-tablet tables with every leader on ts0, then
+  // runs the full rebalancer repeatedly until the leaders are spread within
+  // floor/ceil of the average across all tservers.
+  void CheckGlobalLeaderBalanceConverges(int num_tables, const string& table_prefix) {
+    const int num_tservers = cluster_->num_tablet_servers();
+
+    std::vector<string> table_names;
+    NO_FATALS(CreateSingleTabletTablesOnTs0(num_tables, table_prefix, &table_names));
+
+    const string ts0_uuid = cluster_->mini_tablet_server(0)->uuid();
+    using LeaderMap = std::map<string, int32_t>;
+
+    // Wait for the forced leader moves to settle: every leader should be on ts0.
+    ASSERT_EVENTUALLY([&] {
+      LeaderMap totals;
+      ASSERT_OK(GlobalLeaderDistribution(table_names, &totals));
+      ASSERT_EQ(num_tables, totals.at(ts0_uuid));
+    });
+
+    master::Master* master = cluster_->mini_master()->master();
+    master::AutoLeaderRebalancerTask* leader_rebalancer =
+        master->catalog_manager()->auto_leader_rebalancer();
+
+    // Run the full rebalancer (per-table loop followed by the global pass) a few
+    // times, letting the transfers settle between rounds, until every tserver
+    // holds floor or ceil of the average.
+    constexpr const int32_t kRetries = 10;
+    const double expected_leader_num = static_cast<double>(num_tables) / num_tservers;
+    LeaderMap totals;
+    for (int i = 0; i < kRetries; i++) {
+      SCOPED_TRACE(strings::Substitute("try $0", i));
+      ASSERT_OK(leader_rebalancer->RunLeaderRebalancer());
+      SleepFor(MonoDelta::FromMilliseconds(FLAGS_heartbeat_interval_ms));
+      ASSERT_OK(GlobalLeaderDistribution(table_names, &totals));
+      bool balanced = true;
+      for (const auto& entry : totals) {
+        if (entry.second < std::floor(expected_leader_num) ||
+            entry.second > std::ceil(expected_leader_num)) {
+          balanced = false;
+          break;
+        }
+      }
+      if (balanced) {
+        break;
+      }
+    }
+
+    ASSERT_OK(GlobalLeaderDistribution(table_names, &totals));
+    for (const auto& [uuid, count] : totals) {
+      ASSERT_GE(count, std::floor(expected_leader_num)) << uuid;
+      ASSERT_LE(count, std::ceil(expected_leader_num)) << uuid;
+    }
   }
 
  protected:
@@ -689,6 +788,213 @@ TEST_F(LeaderRebalancerTest, MultiTableLeaderBalance) {
     ASSERT_EQ(0, dist2.at(lo_uuid));
   }, MonoDelta::FromSeconds(120));
   NO_PENDING_FATALS();
+}
+
+// Check that the post-loop global pass corrects cross-table skew that per-table
+// balancing leaves behind.
+//
+// Setup: three single-tablet RF=3 tables on a 3 tserver cluster, with every
+// leader forced onto ts0 ({3,0,0} globally). The per-table loop schedules
+// nothing (each single-tablet table is already balanced), yet the cluster is
+// badly skewed. The global pass should notice ts0 is above the global ceiling
+// (ceil(3/3)=1) and spread the leaders to one per tserver. Without the global
+// pass the per-table loop alone leaves ts0 holding all three, so this guards
+// the global pass from regressing.
+TEST_F(LeaderRebalancerTest, GlobalLeaderBalanceAcrossTables) {
+  cluster_opts_.num_tablet_servers = 3;
+  ASSERT_OK(CreateAndStartCluster());
+  // 3 tables / 3 tservers divides evenly, so the ideal spread is {1,1,1}.
+  NO_FATALS(CheckGlobalLeaderBalanceConverges(3, "global_leader_balance_table"));
+}
+
+// Like GlobalLeaderBalanceAcrossTables, but with a leader count that does not
+// divide evenly across the tservers, which is the case the global pass used to
+// get stuck on.
+//
+// Setup: five single-tablet RF=3 tables on a 3 tserver cluster, every leader
+// forced onto ts0 ({5,0,0} globally). The ideal spread is {2,2,1} (floor(5/3)=1,
+// ceil(5/3)=2).
+//
+// The point of this test is the ceiling-vs-floor destination bar. When the
+// global pass only sends leaders to tservers strictly below the floor, ts0 can
+// fill ts1 and ts2 up to one leader each and then stall at {3,1,1}, leaving ts0
+// permanently above the ceiling. Allowing a destination anywhere below the
+// ceiling lets ts0 hand a second leader to one of them, reaching {2,2,1}. So
+// this test fails if the destination bar regresses back to the floor.
+TEST_F(LeaderRebalancerTest, GlobalLeaderBalanceUneven) {
+  cluster_opts_.num_tablet_servers = 3;
+  ASSERT_OK(CreateAndStartCluster());
+  NO_FATALS(CheckGlobalLeaderBalanceConverges(5, "global_leader_uneven_table"));
+}
+
+// The global pass must never send a leader to a tserver in maintenance mode,
+// and must leave such a tserver out of the average it balances toward.
+//
+// Setup: four single-tablet RF=3 tables with every leader on ts0, then ts2 is
+// put into maintenance mode. Only the global pass can rebalance these tables (a
+// single-tablet table is balanced on its own), and with ts2 excluded it should
+// even the leaders across ts0 and ts1 only, ending at {2,2,0} and never placing
+// a leader on the draining ts2.
+TEST_F(LeaderRebalancerTest, GlobalLeaderBalanceSkipsMaintenanceMode) {
+  cluster_opts_.num_tablet_servers = 3;
+  ASSERT_OK(CreateAndStartCluster());
+
+  constexpr const int kNumTables = 4;
+  std::vector<string> table_names;
+  NO_FATALS(CreateSingleTabletTablesOnTs0(
+      kNumTables, "global_leader_maint_table", &table_names));
+
+  const string ts0_uuid = cluster_->mini_tablet_server(0)->uuid();
+  const string ts1_uuid = cluster_->mini_tablet_server(1)->uuid();
+  const string ts2_uuid = cluster_->mini_tablet_server(2)->uuid();
+  using LeaderMap = std::map<string, int32_t>;
+
+  // Wait for all leaders to land on ts0.
+  ASSERT_EVENTUALLY([&] {
+    LeaderMap totals;
+    ASSERT_OK(GlobalLeaderDistribution(table_names, &totals));
+    ASSERT_EQ(kNumTables, totals.at(ts0_uuid));
+  });
+
+  master::Master* master = cluster_->mini_master()->master();
+  // Put ts2 into maintenance mode so the global pass must avoid it both as a
+  // destination and in the average it balances toward.
+  ASSERT_OK(master->ts_manager()->SetTServerState(
+      ts2_uuid,
+      TServerStatePB::MAINTENANCE_MODE,
+      ChangeTServerStateRequestPB::ALLOW_MISSING_TSERVER,
+      master->catalog_manager()->sys_catalog()));
+
+  master::AutoLeaderRebalancerTask* leader_rebalancer =
+      master->catalog_manager()->auto_leader_rebalancer();
+
+  constexpr const int32_t kRetries = 10;
+  LeaderMap totals;
+  for (int i = 0; i < kRetries; i++) {
+    SCOPED_TRACE(strings::Substitute("try $0", i));
+    ASSERT_OK(leader_rebalancer->RunLeaderRebalancer());
+    SleepFor(MonoDelta::FromMilliseconds(FLAGS_heartbeat_interval_ms));
+    ASSERT_OK(GlobalLeaderDistribution(table_names, &totals));
+    if (totals[ts2_uuid] == 0 &&
+        totals[ts0_uuid] == kNumTables / 2 &&
+        totals[ts1_uuid] == kNumTables / 2) {
+      break;
+    }
+  }
+
+  ASSERT_OK(GlobalLeaderDistribution(table_names, &totals));
+  // ts2 must hold no leaders, and the rest are split evenly over ts0 and ts1.
+  ASSERT_EQ(0, totals[ts2_uuid]);
+  ASSERT_EQ(kNumTables / 2, totals[ts0_uuid]);
+  ASSERT_EQ(kNumTables / 2, totals[ts1_uuid]);
+}
+
+// The global pass must honor leader_rebalancing_max_moves_per_round. With the
+// cap set to 1 and five single-tablet tables all led by ts0 (so per-table
+// balancing is a no-op and only the global pass schedules anything), a single
+// round should schedule exactly one move even though more are needed to balance.
+TEST_F(LeaderRebalancerTest, GlobalLeaderBalanceRespectsMaxMovesPerRound) {
+  const auto saved_max_moves = FLAGS_leader_rebalancing_max_moves_per_round;
+  FLAGS_leader_rebalancing_max_moves_per_round = 1;
+
+  cluster_opts_.num_tablet_servers = 3;
+  ASSERT_OK(CreateAndStartCluster());
+
+  constexpr const int kNumTables = 5;
+  std::vector<string> table_names;
+  NO_FATALS(CreateSingleTabletTablesOnTs0(
+      kNumTables, "global_leader_cap_table", &table_names));
+
+  const string ts0_uuid = cluster_->mini_tablet_server(0)->uuid();
+  using LeaderMap = std::map<string, int32_t>;
+  ASSERT_EVENTUALLY([&] {
+    LeaderMap totals;
+    ASSERT_OK(GlobalLeaderDistribution(table_names, &totals));
+    ASSERT_EQ(kNumTables, totals.at(ts0_uuid));
+  });
+
+  master::Master* master = cluster_->mini_master()->master();
+  master::AutoLeaderRebalancerTask* leader_rebalancer =
+      master->catalog_manager()->auto_leader_rebalancer();
+
+  // A single round: the scheduled-move count reflects only the global pass
+  // (per-table balancing does nothing for single-tablet tables), and the cap
+  // must hold it to one even though four moves are needed to reach {2,2,1}.
+  ASSERT_OK(leader_rebalancer->RunLeaderRebalancer());
+  const int scheduled = MovesScheduledLastRound();
+
+  // Restore the flag before asserting so a failure here doesn't leak it into
+  // later tests.
+  FLAGS_leader_rebalancing_max_moves_per_round = saved_max_moves;
+  ASSERT_EQ(1, scheduled);
+}
+
+// The global pass is deferred to a later round whenever per-table balancing
+// still has moves to make, so the two never act on the cluster at the same
+// time (which would race on the same tablets).
+//
+// Setup: one 9-tablet table seeded badly skewed ({7,2,0}), which keeps the
+// per-table loop busy, plus two single-tablet tables holding a purely global
+// skew (all leaders on ts0, movable only by the global pass). In the round
+// where the per-table loop works the skewed table, the single-tablet leaders
+// must stay put because the global pass does not run.
+TEST_F(LeaderRebalancerTest, GlobalLeaderBalanceDeferredWhilePerTableBusy) {
+  cluster_opts_.num_tablet_servers = 3;
+  ASSERT_OK(CreateAndStartCluster());
+
+  // A 9-tablet table seeded {7,2,0}: per-table balancing has work to do here.
+  const string kSkewedTable = "global_leader_gate_skewed";
+  workload_.reset(new TestWorkload(cluster_.get()));
+  workload_->set_table_name(kSkewedTable);
+  workload_->set_num_tablets(9);
+  workload_->set_num_replicas(3);
+  workload_->Setup();
+  ASSERT_OK(MakeLeaderDistribution({7, 2, 0}, kSkewedTable));
+
+  // Single-tablet tables whose leaders are all on ts0: only the global pass can
+  // move these.
+  constexpr const int kNumGlobalTables = 2;
+  std::vector<string> global_tables;
+  NO_FATALS(CreateSingleTabletTablesOnTs0(
+      kNumGlobalTables, "global_leader_gate_table", &global_tables));
+
+  const string ts0_uuid = cluster_->mini_tablet_server(0)->uuid();
+  using LeaderMap = std::map<string, int32_t>;
+
+  // Wait for the seeded distributions to settle.
+  ASSERT_EVENTUALLY([&] {
+    LeaderMap skewed;
+    ASSERT_OK(GetLeaderDistribution(&skewed, kSkewedTable));
+    ASSERT_EQ(7, skewed.at(ts0_uuid));
+    LeaderMap global_totals;
+    ASSERT_OK(GlobalLeaderDistribution(global_tables, &global_totals));
+    ASSERT_EQ(kNumGlobalTables, global_totals.at(ts0_uuid));
+  });
+
+  master::Master* master = cluster_->mini_master()->master();
+  master::AutoLeaderRebalancerTask* leader_rebalancer =
+      master->catalog_manager()->auto_leader_rebalancer();
+
+  // One round. The per-table loop has work (the skewed table), so the global
+  // pass is gated off this round.
+  ASSERT_OK(leader_rebalancer->RunLeaderRebalancer());
+  // Give any erroneously-issued global transfers time to land before asserting
+  // that they did not happen.
+  SleepFor(MonoDelta::FromMilliseconds(5 * FLAGS_heartbeat_interval_ms));
+
+  // The global-skew tables must be untouched: their leaders are still all on
+  // ts0 because the global pass did not run this round.
+  LeaderMap global_totals;
+  ASSERT_OK(GlobalLeaderDistribution(global_tables, &global_totals));
+  ASSERT_EQ(kNumGlobalTables, global_totals[ts0_uuid]);
+
+  // Sanity check that the per-table loop actually had work this round (so the
+  // gate was exercised): the skewed table moves off {7,2,0}.
+  ASSERT_EVENTUALLY([&] {
+    LeaderMap skewed;
+    ASSERT_OK(GetLeaderDistribution(&skewed, kSkewedTable));
+    ASSERT_LT(skewed[ts0_uuid], 7);
+  });
 }
 
 class FilterSoftDeletedTableTest :
