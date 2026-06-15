@@ -49,6 +49,7 @@
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/security/init.h"
+#include "kudu/tserver/tserver.pb.h"
 #include "kudu/util/cow_object.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/monotime.h"
@@ -66,7 +67,10 @@ using kudu::rpc::MessengerBuilder;
 using kudu::rpc::RpcController;
 using std::map;
 using std::nullopt;
+using std::pair;
+using std::shared_ptr;
 using std::string;
+using std::unordered_map;
 using std::unordered_set;
 using std::vector;
 using strings::Substitute;
@@ -136,8 +140,9 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalanceForTable(
     const scoped_refptr<TableInfo>& table_info,
     const vector<string>& tserver_uuids,
     const unordered_set<string>& exclude_dest_uuids,
-    std::unordered_map<string, int>* global_leader_count,
-    AutoLeaderRebalancerTask::ExecuteMode mode) {
+    unordered_map<string, int>* global_leader_count,
+    AutoLeaderRebalancerTask::ExecuteMode mode,
+    int* num_scheduled_moves) {
   LOG(INFO) << Substitute("leader rebalance for table $0", table_info->table_name());
   TableMetadataLock table_l(table_info.get(), LockMode::READ);
   const SysTablesEntryPB& table_data = table_info->metadata().state().pb;
@@ -230,7 +235,7 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalanceForTable(
   // step 2.
   // pick the servers which number of leaders greater than 1/3 of number of all replicas
   // <uuid, number of replica, number of leader>
-  map<string, std::pair<int32_t, int32_t>> replica_and_leader_count_by_ts_uuid;
+  map<string, pair<int32_t, int32_t>> replica_and_leader_count_by_ts_uuid;
   // uuid->leader should transfer count
   map<string, int32_t> leader_transfer_source;
   size_t remaining_tablets = tablet_infos.size();
@@ -246,7 +251,7 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalanceForTable(
     auto* leader_tablet_ids_ptr = FindOrNull(leader_tablet_ids_by_ts_uuid, uuid);
     int32_t leader_count = leader_tablet_ids_ptr ? leader_tablet_ids_ptr->size() : 0;
     replica_and_leader_count_by_ts_uuid.insert(
-        {uuid, std::pair<int32_t, int32_t>(replica_count, leader_count)});
+        {uuid, pair<int32_t, int32_t>(replica_count, leader_count)});
     VLOG(1) << Substitute(
         "uuid: $0, replica_count: $1, leader_count: $2", uuid, replica_count, leader_count);
 
@@ -274,7 +279,7 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalanceForTable(
 
   // Step 3.
   // Generate transfer task, <tablet_id, from_uuid, to_uuid>
-  map<string, std::pair<string, string>> leader_transfer_tasks;
+  map<string, pair<string, string>> leader_transfer_tasks;
   for (const auto& from_info : leader_transfer_source) {
     string leader_uuid = from_info.first;
     int32_t need_transfer_count = from_info.second;
@@ -310,7 +315,7 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalanceForTable(
         if (ContainsKey(exclude_dest_uuids, follower_uuid)) {
           continue;
         }
-        std::pair<int32_t, int32_t>& replica_and_leader_count =
+        pair<int32_t, int32_t>& replica_and_leader_count =
             replica_and_leader_count_by_ts_uuid[follower_uuid];
         int32_t replica_count = replica_and_leader_count.first;
         if (replica_count <= 0) {
@@ -344,7 +349,7 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalanceForTable(
       if (dest_invalid || dest_follower_uuid.empty()) {
         continue;
       }
-      std::pair<int32_t, int32_t>& replica_and_leader_count =
+      pair<int32_t, int32_t>& replica_and_leader_count =
           replica_and_leader_count_by_ts_uuid[leader_uuid];
       int32_t replica_count = replica_and_leader_count.first;
       int32_t leader_count = replica_and_leader_count.second;
@@ -357,7 +362,7 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalanceForTable(
       }
 
       leader_transfer_tasks.insert(
-          {tablet_id, std::pair<string, string>(leader_uuid, dest_follower_uuid)});
+          {tablet_id, pair<string, string>(leader_uuid, dest_follower_uuid)});
       replica_and_leader_count_by_ts_uuid[leader_uuid].second--;
       replica_and_leader_count_by_ts_uuid[dest_follower_uuid].second++;
       if (global_leader_count) {
@@ -379,7 +384,7 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalanceForTable(
     }
   }
 
-  if (mode == AutoLeaderRebalancerTask::ExecuteMode::TEST) {
+  if (PREDICT_FALSE(mode == AutoLeaderRebalancerTask::ExecuteMode::TEST)) {
     if (!leader_transfer_tasks.empty()) {
       return Status::IllegalState(Substitute("leader_transfer_task size should be 0, but $0",
                                              leader_transfer_tasks.size()));
@@ -388,6 +393,9 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalanceForTable(
   }
 
   moves_scheduled_this_round_for_test_ = leader_transfer_tasks.size();
+  if (num_scheduled_moves) {
+    *num_scheduled_moves += leader_transfer_tasks.size();
+  }
   VLOG(1) << Substitute("leader rebalance tasks, size: $0, leader_transfer_source, size: $1",
                         moves_scheduled_this_round_for_test_.load(),
                         leader_transfer_source.size());
@@ -413,7 +421,7 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalanceForTable(
     if (!host_port) {
       continue;
     }
-    std::shared_ptr<TSDescriptor> leader_desc;
+    shared_ptr<TSDescriptor> leader_desc;
     if (!ts_manager_->LookupTSByUUID(leader_uuid, &leader_desc)) {
       continue;
     }
@@ -440,6 +448,282 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalanceForTable(
   VLOG(0) << Substitute("table: $0, leader rebalance finish, leader transfer count: $1",
                         table_data.name(),
                         leader_transfer_count);
+  return Status::OK();
+}
+
+Status AutoLeaderRebalancerTask::RunGlobalLeaderRebalance(
+    const vector<scoped_refptr<TableInfo>>& table_infos,
+    const vector<string>& tserver_uuids,
+    const unordered_set<string>& exclude_dest_uuids,
+    unordered_map<string, int>* global_leader_count,
+    AutoLeaderRebalancerTask::ExecuteMode mode) {
+  // Callers always pass a non-null map; it isn't optional like it is for the
+  // per-table method.
+  DCHECK(global_leader_count);
+
+  // Destinations in maintenance mode are excluded: such tservers should be
+  // shedding leaders, so they neither count towards the global average nor act
+  // as a move source here. A tserver that hosts no replicas yet (e.g. one that
+  // just joined) still counts: it can only pull the average down, and since it
+  // is a follower of nothing it can never be selected as a destination below,
+  // so it is harmless.
+  vector<string> eligible_uuids;
+  eligible_uuids.reserve(tserver_uuids.size());
+  for (const auto& uuid : tserver_uuids) {
+    if (!ContainsKey(exclude_dest_uuids, uuid)) {
+      eligible_uuids.emplace_back(uuid);
+    }
+  }
+  // At least two tservers are needed to move a leader between them.
+  if (eligible_uuids.size() < 2) {
+    return Status::OK();
+  }
+
+  // 'ceil_avg' is the ceiling of the average number of leaders per eligible
+  // tserver. A perfectly balanced cluster has every tserver at the floor or the
+  // ceiling of that average. A tserver above 'ceil_avg' is overloaded and must
+  // shed leaders; any tserver still below 'ceil_avg' has room to take one.
+  // Using the ceiling (rather than the floor) as the destination bar matters
+  // when the leaders don't divide evenly: it lets an overloaded tserver hand a
+  // leader to one currently sitting at the floor, which is exactly the move
+  // needed to reach e.g. {3,3,2,2} instead of getting stuck at {4,2,2,2}.
+  //
+  // A leader is only ever handed to a tserver that already hosts a follower of
+  // the tablet in question, so a tserver holding no replicas (e.g. one that
+  // just joined) can never receive leadership here. Such a tserver can drag the
+  // average down, but at worst the pass makes no move for it rather than
+  // shuffling leadership back and forth.
+  int64_t total_leaders = 0;
+  for (const auto& uuid : eligible_uuids) {
+    total_leaders += FindWithDefault(*global_leader_count, uuid, 0);
+  }
+  const int64_t num_eligible = static_cast<int64_t>(eligible_uuids.size());
+  const int64_t ceil_avg = (total_leaders + num_eligible - 1) / num_eligible;
+
+  // Fast path: if nobody is above the ceiling there is nothing to correct, so
+  // skip the relatively expensive tablet location gathering below. This is the
+  // common case once a cluster has converged.
+  bool any_overloaded = false;
+  for (const auto& uuid : eligible_uuids) {
+    if (FindWithDefault(*global_leader_count, uuid, 0) > ceil_avg) {
+      any_overloaded = true;
+      break;
+    }
+  }
+  if (!any_overloaded) {
+    return Status::OK();
+  }
+
+  // Per-tablet leadership for a single table, gathered fresh from the catalog.
+  struct TabletPlacement {
+    string tablet_id;
+    string leader_uuid;
+    vector<string> follower_uuids;
+  };
+
+  // Plan and (in NORMAL mode) execute corrective moves, table by table. The
+  // global counts decide who is over/underloaded, while the per-table leader
+  // counts keep each affected table within its own floor/ceil: a leader is
+  // only moved from a tserver holding more of this table's leaders than the
+  // destination, so the table itself does not become skewed.
+  int remaining_moves = FLAGS_leader_rebalancing_max_moves_per_round;
+  int global_moves_scheduled = 0;
+  for (const auto& table_info : table_infos) {
+    if (remaining_moves <= 0) {
+      break;
+    }
+    TableMetadataLock table_l(table_info.get(), LockMode::READ);
+    const SysTablesEntryPB& table_data = table_info->metadata().state().pb;
+    const int replication_factor = table_data.num_replicas();
+    // Removed tables aren't rebalanced, and a single replica tablet has no
+    // follower to hand leadership to.
+    if (table_data.state() == SysTablesEntryPB::REMOVED || replication_factor <= 1) {
+      continue;
+    }
+
+    vector<TabletPlacement> placements;
+    // tserver uuid -> number of this table's leaders it currently holds.
+    map<string, int> table_leader_count_by_ts;
+    map<string, HostPort> host_port_by_leader_ts_uuid;
+
+    vector<scoped_refptr<TabletInfo>> tablet_infos;
+    table_info->GetAllTablets(&tablet_infos);
+    for (const auto& tablet : tablet_infos) {
+      TabletMetadataLock tablet_l(tablet.get(), LockMode::READ);
+
+      TabletLocationsPB locs_pb;
+      CatalogManager::TSInfosDict ts_infos_dict;
+      {
+        CatalogManager::ScopedLeaderSharedLock leaderlock(catalog_manager_);
+        RETURN_NOT_OK(leaderlock.first_failed_status());
+        RETURN_NOT_OK(catalog_manager_->GetTabletLocations(
+            tablet->id(),
+            ReplicaTypeFilter::VOTER_REPLICA,
+            /*use_external_addr=*/false,
+            &locs_pb,
+            &ts_infos_dict,
+            nullopt));
+      }
+
+      TabletPlacement placement;
+      placement.tablet_id = tablet->id();
+      for (const auto& r : locs_pb.interned_replicas()) {
+        const TSInfoPB& ts_info = *(ts_infos_dict.ts_info_pbs()[r.ts_info_idx()]);
+        const string& uuid = ts_info.permanent_uuid();
+        if (r.role() == RaftPeerPB::LEADER) {
+          placement.leader_uuid = uuid;
+          table_leader_count_by_ts[uuid]++;
+          InsertIfNotPresent(
+              &host_port_by_leader_ts_uuid, uuid, HostPortFromPB(ts_info.rpc_addresses(0)));
+        } else if (r.role() == RaftPeerPB::FOLLOWER) {
+          placement.follower_uuids.emplace_back(uuid);
+        }
+      }
+      // A tablet with no observed leader can't be a move source.
+      if (!placement.leader_uuid.empty()) {
+        placements.emplace_back(std::move(placement));
+      }
+    }
+
+    // Plan this table's corrective transfers, <tablet_id, <from_uuid, to_uuid>>.
+    map<string, pair<string, string>> leader_transfer_tasks;
+    for (const auto& placement : placements) {
+      if (remaining_moves <= 0) {
+        break;
+      }
+      const string& source_uuid = placement.leader_uuid;
+      // Only drain tservers that are above the global ceiling.
+      if (FindWithDefault(*global_leader_count, source_uuid, 0) <= ceil_avg) {
+        continue;
+      }
+      // Skip degraded tablets that lack a full set of voters; per-table
+      // balancing avoids them too.
+      if (placement.follower_uuids.size() + 1 < replication_factor) {
+        continue;
+      }
+      const int source_table_count = FindWithDefault(table_leader_count_by_ts, source_uuid, 0);
+
+      // Pick the most underloaded follower that can take a leader without
+      // skewing this table. Ties are broken by the smaller uuid so the result
+      // does not depend on the order replicas happen to come back in.
+      string dest_uuid;
+      int dest_global_count = 0;
+      for (const auto& follower_uuid : placement.follower_uuids) {
+        if (ContainsKey(exclude_dest_uuids, follower_uuid)) {
+          continue;
+        }
+        const int follower_global_count =
+            FindWithDefault(*global_leader_count, follower_uuid, 0);
+        // The destination must have room below the global ceiling ...
+        if (follower_global_count >= ceil_avg) {
+          continue;
+        }
+        // ... and must hold strictly fewer of this table's leaders than the
+        // source, so handing it one keeps the table within its own floor/ceil.
+        if (FindWithDefault(table_leader_count_by_ts, follower_uuid, 0) >= source_table_count) {
+          continue;
+        }
+        if (dest_uuid.empty() ||
+            follower_global_count < dest_global_count ||
+            (follower_global_count == dest_global_count && follower_uuid < dest_uuid)) {
+          dest_uuid = follower_uuid;
+          dest_global_count = follower_global_count;
+        }
+      }
+      if (dest_uuid.empty()) {
+        continue;
+      }
+
+      if (PREDICT_FALSE(mode == AutoLeaderRebalancerTask::ExecuteMode::TEST)) {
+        // In test mode we only want to learn whether the cluster is globally
+        // balanced, so report the first corrective move that would be made
+        // without planning further or mutating the caller's counts.
+        return Status::IllegalState(Substitute(
+            "global leader rebalance would move a leader off $0 for table $1",
+            source_uuid, table_data.name()));
+      }
+
+      // Update the counts as if the move has already happened so later tablets
+      // in this round see a consistent picture. The execution below may end up
+      // skipping a transfer (e.g. the destination enters maintenance mode or
+      // the leader can no longer be looked up), so these counts can drift from
+      // what actually transferred; that is fine, the next round rebuilds the
+      // distribution from scratch.
+      leader_transfer_tasks.insert(
+          {placement.tablet_id, pair<string, string>(source_uuid, dest_uuid)});
+      (*global_leader_count)[source_uuid]--;
+      (*global_leader_count)[dest_uuid]++;
+      table_leader_count_by_ts[source_uuid]--;
+      table_leader_count_by_ts[dest_uuid]++;
+      remaining_moves--;
+    }
+
+    if (leader_transfer_tasks.empty()) {
+      continue;
+    }
+    global_moves_scheduled += leader_transfer_tasks.size();
+
+    for (const auto& task : leader_transfer_tasks) {
+      const string& tablet_id = task.first;
+      const string& leader_uuid = task.second.first;
+      const string& dest_uuid = task.second.second;
+      if (PREDICT_FALSE(TServerStatePB::MAINTENANCE_MODE ==
+                        ts_manager_->GetTServerState(dest_uuid))) {
+        continue;
+      }
+      auto* host_port = FindOrNull(host_port_by_leader_ts_uuid, leader_uuid);
+      if (!host_port) {
+        continue;
+      }
+      shared_ptr<TSDescriptor> leader_desc;
+      if (!ts_manager_->LookupTSByUUID(leader_uuid, &leader_desc)) {
+        continue;
+      }
+
+      LeaderStepDownRequestPB request;
+      request.set_dest_uuid(leader_uuid);
+      request.set_tablet_id(tablet_id);
+      request.set_mode(LeaderStepDownMode::GRACEFUL);
+      request.set_new_leader_uuid(dest_uuid);
+
+      LeaderStepDownResponsePB response;
+      RpcController rpc;
+      rpc.set_timeout(MonoDelta::FromSeconds(FLAGS_auto_leader_rebalancing_rpc_timeout_seconds));
+
+      // This pass is best-effort: a transfer may fail transiently (for example
+      // "already in progress" if a previous round's move for this tablet has
+      // not settled yet). Log and move on rather than aborting the round, since
+      // the next round re-evaluates the distribution from scratch.
+      vector<Sockaddr> resolved;
+      Status s = host_port->ResolveAddresses(&resolved);
+      if (!s.ok()) {
+        WARN_NOT_OK(s, Substitute("global leader rebalance: cannot resolve $0", leader_uuid));
+        continue;
+      }
+      ConsensusServiceProxy proxy(messenger_, resolved[0], host_port->host());
+      s = proxy.LeaderStepDown(request, &response, &rpc);
+      if (!s.ok()) {
+        WARN_NOT_OK(s, Substitute(
+            "global leader rebalance: leader step down for tablet $0 failed", tablet_id));
+        continue;
+      }
+      if (!response.has_error()) {
+        VLOG(1) << Substitute(
+            "global leader rebalance transfer table: $0, tablet_id: $1, from: $2 to: $3",
+            table_data.name(), tablet_id, leader_uuid, dest_uuid);
+      } else {
+        LOG(WARNING) << Substitute(
+            "global leader rebalance: transfer for tablet $0 (from $1 to $2) failed: $3",
+            tablet_id, leader_uuid, dest_uuid, response.error().ShortDebugString());
+      }
+    }
+  }
+
+  // In TEST mode the method returns early above as soon as a move is found, so
+  // reaching here means nothing was scheduled and this is a no-op increment.
+  moves_scheduled_this_round_for_test_ += global_moves_scheduled;
+  VLOG(0) << Substitute("global leader rebalance finished, scheduled $0 move(s)",
+                        global_moves_scheduled);
   return Status::OK();
 }
 
@@ -498,18 +782,37 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalancer() {
   // Start the global map at 0 for every live tserver. As each table is processed
   // we add its real leader counts and apply any planned moves, so later tables
   // can see the leader load across all tables when they need to break a tie.
-  std::unordered_map<string, int> global_leader_count_by_ts_uuid;
+  unordered_map<string, int> global_leader_count_by_ts_uuid;
   for (const auto& uuid : tserver_uuids) {
     global_leader_count_by_ts_uuid[uuid] = 0;
   }
 
+  int per_table_moves_scheduled = 0;
   for (const auto& table_info : table_infos) {
     RETURN_NOT_OK(RunLeaderRebalanceForTable(
-        table_info, tserver_uuids, exclude_dest_uuids, &global_leader_count_by_ts_uuid));
+        table_info, tserver_uuids, exclude_dest_uuids, &global_leader_count_by_ts_uuid,
+        AutoLeaderRebalancerTask::ExecuteMode::NORMAL, &per_table_moves_scheduled));
   }
-  // TODO(KUDU-3767): add a post-loop global pass here to detect and correct
-  // tservers that are globally overloaded even when per-table balance is achieved
-  // (e.g. many single-tablet tables whose leaders all land on the same tserver).
+  // Every table is now balanced on its own, but the cluster can still be
+  // globally skewed if one tserver kept getting the ceiling allocation across
+  // tables (e.g. many single-tablet tables whose lone leader landed on it).
+  // Run a global pass to shed leaders from globally overloaded tservers onto
+  // underloaded ones without pushing any individual table out of balance.
+  //
+  // Only do this once per-table balancing has nothing left to do this round.
+  // While per-table moves are still being scheduled the cluster is mid-flight:
+  // running the global pass now would re-target tablets the per-table loop just
+  // moved (the leadership transfers are asynchronous), and a follow-up round
+  // does the global correction with a consistent view instead.
+  //
+  // TODO(gabriellalotz): if per-table balancing keeps finding work every round
+  // (e.g. from continuous leader elections), the global pass can be starved.
+  // Emit a metric when it's skipped for this reason so the situation is
+  // diagnosable.
+  if (per_table_moves_scheduled == 0) {
+    RETURN_NOT_OK(RunGlobalLeaderRebalance(
+        table_infos, tserver_uuids, exclude_dest_uuids, &global_leader_count_by_ts_uuid));
+  }
   // @TODO(duyuqi)
   // Enrich the log and add metrics for leader rebalancer.
   LOG(INFO) << "All tables' leader rebalancing finished this round";
