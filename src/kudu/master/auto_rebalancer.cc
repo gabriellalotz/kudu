@@ -258,6 +258,10 @@ void AutoRebalancerTask::RunLoop() {
   vector<Rebalancer::ReplicaMove> replica_moves;
   while (!shutdown_.WaitFor(
       MonoDelta::FromSeconds(FLAGS_auto_rebalancing_interval_seconds))) {
+    // Always retry stuck replace-marker cleanups, even if the rebalancer is
+    // disabled — the test / operator may have disabled it precisely because
+    // a prior round failed, and the markers must still converge.
+    ProcessPendingReplaceClears();
     if (!FLAGS_auto_rebalancing_enabled) {
       // Toggling the auto-rebalancer on/off by changing FLAGS_auto_rebalancing_enabled,
       // will take effect in the next loop. Already scheduled/running replica moves will
@@ -278,6 +282,12 @@ void AutoRebalancerTask::RunLoop() {
     }
 
     number_of_loop_iterations_for_test_++;
+    // Reset per-round counters at the start of each iteration so test
+    // assertions reading NumMovesScheduled() after a failed/skipped round
+    // (e.g. BuildClusterRawInfo during replica recovery) do not observe a
+    // stale value from a prior successful round.
+    moves_attempted_this_round_for_test_ = 0;
+    moves_scheduled_this_round_for_test_ = 0;
 
     // Structs to hold information about the cluster's status.
     ClusterRawInfo raw_info;
@@ -858,45 +868,54 @@ Status AutoRebalancerTask::CheckReplicaMovesCompleted(
         moves_per_tserver_[dst_ts_uuid]--;
       }
 
-      // If a move fails, clear the replace marker so the master doesn't keep
-      // trying to replace the replica indefinitely (especially for leaders).
-      BulkChangeConfigRequestPB req;
-      auto* modify_peer = req.add_config_changes();
-      modify_peer->set_type(MODIFY_PEER);
-      *modify_peer->mutable_peer()->mutable_permanent_uuid() = move.ts_uuid_from;
-      modify_peer->mutable_peer()->mutable_attrs()->set_replace(false);
-      string leader_uuid;
-      HostPort leader_hp;
-      Status clear_replace_status = GetTabletLeader(move.tablet_uuid, &leader_uuid, &leader_hp);
-      // Best-effort cleanup: failures here should not keep the move queued.
-      if (!clear_replace_status.ok()) {
-        LOG(WARNING) << "Removing replace marker failed: "
-                     << clear_replace_status.message().ToString();
-      } else {
-        ChangeConfigResponsePB resp;
-        RpcController rpc;
-        rpc.set_timeout(MonoDelta::FromSeconds(FLAGS_auto_rebalancing_rpc_timeout_seconds));
-        req.set_dest_uuid(leader_uuid);
-        req.set_tablet_id(move.tablet_uuid);
-        vector<Sockaddr> resolved;
-        clear_replace_status = leader_hp.ResolveAddresses(&resolved);
-        if (!clear_replace_status.ok()) {
-          LOG(WARNING) << "Removing replace marker failed: "
-                       << clear_replace_status.message().ToString();
-        } else {
-          ConsensusServiceProxy proxy(messenger_, resolved[0], leader_hp.host());
-          clear_replace_status = proxy.BulkChangeConfig(req, &resp, &rpc);
-          if (clear_replace_status.ok() && resp.has_error()) {
-            clear_replace_status = StatusFromPB(resp.error().status());
-          }
-          if (!clear_replace_status.ok()) {
-            LOG(WARNING) << "Removing replace marker failed: "
-                         << clear_replace_status.message().ToString();
-          }
+      // Clear the replace marker so the master doesn't keep trying to
+      // replace the replica indefinitely (especially for leaders). The
+      // schedule call moments earlier may have left the tablet's leader
+      // doing concurrent work — auto-promoting the just-added NON_VOTER,
+      // stepping down because the source has replace=true, or accepting
+      // an explicit leader transfer — and the cleanup BulkChangeConfig
+      // can race with that work and be rejected by the leader. Retry
+      // transient failures with bounded backoff; the catalog manager's
+      // auto-replacement is not guaranteed to clean this up otherwise
+      // (it requires a NON_VOTER promotion, which is not guaranteed
+      // when the move was treated as failed).
+      constexpr int kMaxClearAttempts = 3;
+      Status clear_replace_status;
+      for (int attempt = 1; attempt <= kMaxClearAttempts; ++attempt) {
+        clear_replace_status = TryClearReplaceMarker(move);
+        if (clear_replace_status.ok()) break;
+        // The source peer being absent from the config (NotFound) or the
+        // request being rejected because the marker is already cleared
+        // (InvalidArgument from the no-op MODIFY_PEER guard) both mean
+        // the post-condition is already satisfied.
+        if (clear_replace_status.IsNotFound() ||
+            clear_replace_status.IsInvalidArgument()) {
+          clear_replace_status = Status::OK();
+          break;
+        }
+        if (attempt == kMaxClearAttempts) break;
+        // Bounded inline backoff: 100ms, 200ms (0.3s total). Failures
+        // beyond this fall through to pending_replace_clears_, which
+        // the next RunLoop iteration retries — leadership transfers and
+        // pending config changes typically resolve within a single
+        // rebalancer interval, and re-trying inline only delays
+        // ExecuteMoves further.
+        const auto delay = MonoDelta::FromMilliseconds(100 * (1 << (attempt - 1)));
+        if (shutdown_.WaitFor(delay)) {
+          // Shutdown requested; bail without erasing so a rerun (if any)
+          // sees the same state.
+          return s;
         }
       }
+      if (!clear_replace_status.ok()) {
+        LOG(WARNING) << Substitute(
+            "Removing replace marker failed after $0 inline attempts; "
+            "will retry on next rebalancer loop iteration: $1",
+            kMaxClearAttempts, clear_replace_status.message().ToString());
+        pending_replace_clears_.emplace_back(move);
+      }
 
-      // Always drop the failed move so rebalancing can make progress.
+      // Drop the failed move so rebalancing can make progress.
       replica_moves->erase(replica_moves->begin() + i);
       LOG(WARNING) << Substitute("Could not move replica: $0", s.ToString());
       return s;
@@ -1051,6 +1070,59 @@ Status AutoRebalancerTask::CheckMoveCompleted(
   }
 
   return Status::OK();
+}
+
+Status AutoRebalancerTask::TryClearReplaceMarker(
+    const Rebalancer::ReplicaMove& move) {
+  string leader_uuid;
+  HostPort leader_hp;
+  RETURN_NOT_OK(GetTabletLeader(move.tablet_uuid, &leader_uuid, &leader_hp));
+  vector<Sockaddr> resolved;
+  RETURN_NOT_OK(leader_hp.ResolveAddresses(&resolved));
+
+  BulkChangeConfigRequestPB req;
+  auto* modify_peer = req.add_config_changes();
+  modify_peer->set_type(MODIFY_PEER);
+  *modify_peer->mutable_peer()->mutable_permanent_uuid() = move.ts_uuid_from;
+  modify_peer->mutable_peer()->mutable_attrs()->set_replace(false);
+  req.set_dest_uuid(leader_uuid);
+  req.set_tablet_id(move.tablet_uuid);
+
+  ChangeConfigResponsePB resp;
+  RpcController rpc;
+  rpc.set_timeout(MonoDelta::FromSeconds(FLAGS_auto_rebalancing_rpc_timeout_seconds));
+  ConsensusServiceProxy proxy(messenger_, resolved[0], leader_hp.host());
+  RETURN_NOT_OK(proxy.BulkChangeConfig(req, &resp, &rpc));
+  if (resp.has_error()) {
+    return StatusFromPB(resp.error().status());
+  }
+  return Status::OK();
+}
+
+void AutoRebalancerTask::ProcessPendingReplaceClears() {
+  if (pending_replace_clears_.empty()) {
+    return;
+  }
+  // Without catalog leadership we can't resolve tablet leaders, and any
+  // marker we left behind is now the new leader's responsibility.
+  {
+    CatalogManager::ScopedLeaderSharedLock l(catalog_manager_);
+    if (!l.first_failed_status().ok()) {
+      return;
+    }
+  }
+  vector<Rebalancer::ReplicaMove> still_pending;
+  still_pending.reserve(pending_replace_clears_.size());
+  for (const auto& move : pending_replace_clears_) {
+    Status s = TryClearReplaceMarker(move);
+    if (s.ok() || s.IsNotFound() || s.IsInvalidArgument()) {
+      // Cleared, peer absent from config, or no-op MODIFY_PEER guard
+      // rejected the request because the marker was already cleared.
+      continue;
+    }
+    still_pending.emplace_back(move);
+  }
+  pending_replace_clears_ = std::move(still_pending);
 }
 
 } // namespace master
