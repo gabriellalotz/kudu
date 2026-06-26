@@ -267,11 +267,24 @@ Status TwoDimensionalGreedyAlgo::GetNextMove(
   // leadership transfer and can disrupt active clients. We track the best
   // non-leader candidate and a leader fallback, using the latter only when no
   // non-leader move is available.
+  // equal_range() yields the equal-skew tables in the multimap's insertion
+  // order, which would make the first such table consistently win the tie.
+  // Collect the range into a vector and, when PICK_RANDOM is in effect,
+  // shuffle it so the follower-preference scan below considers the
+  // equally-skewed tables in a random order. With PICK_FIRST the original
+  // deterministic order is preserved.
   const auto range = table_info_by_skew.equal_range(max_table_skew);
+  vector<TableBalanceInfo> equal_skew_tables;
+  for (auto it = range.first; it != range.second; ++it) {
+    equal_skew_tables.push_back(it->second);
+  }
+  if (equal_skew_opt_ == EqualSkewOption::PICK_RANDOM) {
+    shuffle(equal_skew_tables.begin(), equal_skew_tables.end(), generator_);
+  }
+
   optional<TableReplicaMove> non_leader_move;
   optional<TableReplicaMove> leader_fallback;
-  for (auto it = range.first; it != range.second; ++it) {
-    const TableBalanceInfo& tbi = it->second;
+  for (const TableBalanceInfo& tbi : equal_skew_tables) {
     const auto& servers_by_table_replica_count = tbi.servers_by_replica_count;
     if (servers_by_table_replica_count.empty()) {
       return Status::InvalidArgument(Substitute(
