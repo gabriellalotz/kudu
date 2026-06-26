@@ -405,6 +405,66 @@ TEST(RebalanceAlgoUnitTest, PreferFollowerMovesLeaderFallbackWhenFollowerMapEmpt
   ASSERT_EQ((TableReplicaMove{ "A", "", "0", "1" }), moves[0]);
 }
 
+// Among tables tied for the maximum skew, the PICK_RANDOM policy must break the
+// tie randomly rather than always selecting the first table in the multimap's
+// internal (insertion) order. With three equally-skewed tables, repeated
+// single-move runs should select more than one distinct table.
+TEST(RebalanceAlgoUnitTest, EqualSkewTieBreakingIsRandomized) {
+  const TestClusterConfig kConfig = {
+    kNoLocations,
+    { "0", "1", "2", },
+    {
+      { "A", "", { 2, 0, 0, } },
+      { "B", "", { 2, 0, 0, } },
+      { "C", "", { 2, 0, 0, } },
+    },
+    {},
+  };
+
+  ClusterInfo ci;
+  ClusterConfigToClusterInfo(kConfig, &ci);
+
+  TwoDimensionalGreedyAlgo algo(
+      TwoDimensionalGreedyAlgo::EqualSkewOption::PICK_RANDOM);
+  set<string> chosen_tables;
+  for (int i = 0; i < 100; ++i) {
+    vector<TableReplicaMove> moves;
+    ASSERT_OK(algo.GetNextMoves(ci, 1, &moves));
+    ASSERT_EQ(1, moves.size());
+    chosen_tables.insert(moves[0].table_id);
+  }
+  // With 3 tied tables and 100 trials, the odds of only ever selecting a single
+  // table by chance are ~3 * (1/3)^100, i.e. effectively zero.
+  EXPECT_GT(chosen_tables.size(), 1);
+}
+
+// The PICK_FIRST policy must preserve the original deterministic tie-breaking:
+// the first equal-skew table in the multimap order ("A" here) is always chosen.
+TEST(RebalanceAlgoUnitTest, EqualSkewTieBreakingPickFirstIsDeterministic) {
+  const TestClusterConfig kConfig = {
+    kNoLocations,
+    { "0", "1", "2", },
+    {
+      { "A", "", { 2, 0, 0, } },
+      { "B", "", { 2, 0, 0, } },
+      { "C", "", { 2, 0, 0, } },
+    },
+    {},
+  };
+
+  ClusterInfo ci;
+  ClusterConfigToClusterInfo(kConfig, &ci);
+
+  TwoDimensionalGreedyAlgo algo(
+      TwoDimensionalGreedyAlgo::EqualSkewOption::PICK_FIRST);
+  for (int i = 0; i < 20; ++i) {
+    vector<TableReplicaMove> moves;
+    ASSERT_OK(algo.GetNextMoves(ci, 1, &moves));
+    ASSERT_EQ(1, moves.size());
+    EXPECT_EQ("A", moves[0].table_id);
+  }
+}
+
 // Various scenarios of balanced configurations where no moves are expected
 // to happen.
 TEST(RebalanceAlgoUnitTest, AlreadyBalanced) {
