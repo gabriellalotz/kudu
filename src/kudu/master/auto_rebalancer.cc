@@ -81,6 +81,8 @@ using kudu::consensus::BulkChangeConfigRequestPB;
 using kudu::consensus::ChangeConfigResponsePB;
 using kudu::consensus::ConsensusServiceProxy;
 using kudu::consensus::ConsensusStatePB;
+using kudu::consensus::GetConsensusStateRequestPB;
+using kudu::consensus::GetConsensusStateResponsePB;
 using kudu::consensus::LeaderStepDownMode;
 using kudu::consensus::LeaderStepDownRequestPB;
 using kudu::consensus::LeaderStepDownResponsePB;
@@ -258,6 +260,10 @@ void AutoRebalancerTask::RunLoop() {
   vector<Rebalancer::ReplicaMove> replica_moves;
   while (!shutdown_.WaitFor(
       MonoDelta::FromSeconds(FLAGS_auto_rebalancing_interval_seconds))) {
+    // Retry any stuck replace-marker cleanups first, even when rebalancing is
+    // disabled: it may have been turned off right after a round failed, and
+    // those markers still need to be cleared.
+    ProcessPendingReplaceClears();
     if (!FLAGS_auto_rebalancing_enabled) {
       // Toggling the auto-rebalancer on/off by changing FLAGS_auto_rebalancing_enabled,
       // will take effect in the next loop. Already scheduled/running replica moves will
@@ -278,6 +284,12 @@ void AutoRebalancerTask::RunLoop() {
     }
 
     number_of_loop_iterations_for_test_++;
+    // Reset the per-round counters at the start of each iteration. Otherwise a
+    // round that gets skipped later (say, BuildClusterRawInfo failing during
+    // recovery) would leave tests reading a stale count from the previous
+    // round.
+    moves_attempted_this_round_for_test_ = 0;
+    moves_scheduled_this_round_for_test_ = 0;
 
     // Structs to hold information about the cluster's status.
     ClusterRawInfo raw_info;
@@ -511,7 +523,10 @@ Status AutoRebalancerTask::GetTabletLeader(
       return Status::OK();
     }
   }
-  return Status::NotFound(Substitute("Couldn't find leader for tablet $0", tablet_id));
+  // No leader at the moment, most likely a transient election. This is worth
+  // retrying, so don't use NotFound, which callers read as "the replica is gone".
+  return Status::ServiceUnavailable(
+      Substitute("Couldn't find leader for tablet $0", tablet_id));
 }
 
 void AutoRebalancerTask::ExecuteMoves(
@@ -837,7 +852,7 @@ Status AutoRebalancerTask::BuildClusterRawInfo(
 Status AutoRebalancerTask::CheckReplicaMovesCompleted(
     vector<rebalance::Rebalancer::ReplicaMove>* replica_moves) {
 
-  bool move_is_complete;
+  bool move_is_complete = false;
   vector<int> indexes_to_remove;
 
   for (int i = 0; i < replica_moves->size(); ++i) {
@@ -858,45 +873,50 @@ Status AutoRebalancerTask::CheckReplicaMovesCompleted(
         moves_per_tserver_[dst_ts_uuid]--;
       }
 
-      // If a move fails, clear the replace marker so the master doesn't keep
-      // trying to replace the replica indefinitely (especially for leaders).
-      BulkChangeConfigRequestPB req;
-      auto* modify_peer = req.add_config_changes();
-      modify_peer->set_type(MODIFY_PEER);
-      *modify_peer->mutable_peer()->mutable_permanent_uuid() = move.ts_uuid_from;
-      modify_peer->mutable_peer()->mutable_attrs()->set_replace(false);
-      string leader_uuid;
-      HostPort leader_hp;
-      Status clear_replace_status = GetTabletLeader(move.tablet_uuid, &leader_uuid, &leader_hp);
-      // Best-effort cleanup: failures here should not keep the move queued.
-      if (!clear_replace_status.ok()) {
-        LOG(WARNING) << "Removing replace marker failed: "
-                     << clear_replace_status.message().ToString();
-      } else {
-        ChangeConfigResponsePB resp;
-        RpcController rpc;
-        rpc.set_timeout(MonoDelta::FromSeconds(FLAGS_auto_rebalancing_rpc_timeout_seconds));
-        req.set_dest_uuid(leader_uuid);
-        req.set_tablet_id(move.tablet_uuid);
-        vector<Sockaddr> resolved;
-        clear_replace_status = leader_hp.ResolveAddresses(&resolved);
-        if (!clear_replace_status.ok()) {
-          LOG(WARNING) << "Removing replace marker failed: "
-                       << clear_replace_status.message().ToString();
-        } else {
-          ConsensusServiceProxy proxy(messenger_, resolved[0], leader_hp.host());
-          clear_replace_status = proxy.BulkChangeConfig(req, &resp, &rpc);
-          if (clear_replace_status.ok() && resp.has_error()) {
-            clear_replace_status = StatusFromPB(resp.error().status());
-          }
-          if (!clear_replace_status.ok()) {
-            LOG(WARNING) << "Removing replace marker failed: "
-                         << clear_replace_status.message().ToString();
-          }
+      // Clear the replace marker so the master doesn't keep trying to replace
+      // the replica (especially painful for leaders). Right after we scheduled
+      // the move the leader may still be busy with its own config changes
+      // (promoting the new NON_VOTER, stepping down because the source is
+      // marked for replacement, or handing off leadership), so this cleanup can
+      // race with that work and get rejected. Retry transient failures with a
+      // short backoff. We can't count on the catalog manager's auto-replacement
+      // to clean this up instead, since that needs a NON_VOTER promotion which
+      // may never happen once the move is treated as failed.
+      constexpr int kMaxClearAttempts = 3;
+      Status clear_replace_status;
+      for (int attempt = 1; attempt <= kMaxClearAttempts; ++attempt) {
+        clear_replace_status = TryClearReplaceMarker(move);
+        // OK includes the case where the marker was already cleared.
+        if (clear_replace_status.ok()) break;
+        // Nothing left to clear: the replica is gone from the config (NotFound)
+        // or the marker was already cleared (InvalidArgument).
+        if (clear_replace_status.IsNotFound() ||
+            clear_replace_status.IsInvalidArgument()) {
+          clear_replace_status = Status::OK();
+          break;
+        }
+        if (attempt == kMaxClearAttempts) break;
+        // Short inline backoff (100ms, then 200ms). Anything still failing
+        // after that goes onto pending_replace_clears_ and is retried on the
+        // next loop iteration; leader transfers and pending config changes
+        // usually settle within one rebalancer interval, and spinning here
+        // any longer would just hold up ExecuteMoves.
+        const auto delay = MonoDelta::FromMilliseconds(100 * (1 << (attempt - 1)));
+        if (shutdown_.WaitFor(delay)) {
+          // Shutdown requested; bail without erasing so a rerun (if any)
+          // sees the same state.
+          return s;
         }
       }
+      if (!clear_replace_status.ok()) {
+        LOG(WARNING) << Substitute(
+            "Removing replace marker failed after $0 inline attempts; "
+            "will retry on next rebalancer loop iteration: $1",
+            kMaxClearAttempts, clear_replace_status.message().ToString());
+        pending_replace_clears_.emplace_back(move);
+      }
 
-      // Always drop the failed move so rebalancing can make progress.
+      // Drop the failed move so rebalancing can make progress.
       replica_moves->erase(replica_moves->begin() + i);
       LOG(WARNING) << Substitute("Could not move replica: $0", s.ToString());
       return s;
@@ -1051,6 +1071,124 @@ Status AutoRebalancerTask::CheckMoveCompleted(
   }
 
   return Status::OK();
+}
+
+Status AutoRebalancerTask::TryClearReplaceMarker(
+    const Rebalancer::ReplicaMove& move) {
+  string leader_uuid;
+  HostPort leader_hp;
+  // Resolving the leader also re-checks our own catalog leadership (it takes the
+  // leader lock), so if we've lost it here, or there's no tablet leader yet, we
+  // bail out and the caller leaves the marker pending.
+  RETURN_NOT_OK(GetTabletLeader(move.tablet_uuid, &leader_uuid, &leader_hp));
+  vector<Sockaddr> resolved;
+  RETURN_NOT_OK(leader_hp.ResolveAddresses(&resolved));
+  ConsensusServiceProxy proxy(messenger_, resolved[0], leader_hp.host());
+
+  // Try to clear only the marker our own move set, and only if nobody has
+  // touched the config since. Other actors (an operator running
+  // `kudu cluster rebalance`, or the catalog re-replicating an under-replicated
+  // tablet) can set 'replace' on the same replica for good reasons, and clearing
+  // that out from under them would interfere with their work and move replicas
+  // around for no reason. So read the current config and CAS the clear against
+  // its opid_index below. We read from the leader rather than the catalog, whose
+  // view lags by a heartbeat and would give a stale opid.
+  ConsensusStatePB cstate;
+  {
+    GetConsensusStateRequestPB req;
+    GetConsensusStateResponsePB resp;
+    RpcController rpc;
+    rpc.set_timeout(MonoDelta::FromSeconds(FLAGS_auto_rebalancing_rpc_timeout_seconds));
+    req.set_dest_uuid(leader_uuid);
+    req.add_tablet_ids(move.tablet_uuid);
+    RETURN_NOT_OK(proxy.GetConsensusState(req, &resp, &rpc));
+    if (resp.has_error()) {
+      return StatusFromPB(resp.error().status());
+    }
+    if (resp.tablets_size() != 1 || !resp.tablets(0).has_cstate()) {
+      // Leader didn't return this tablet (yet); treat as transient and retry.
+      return Status::ServiceUnavailable(Substitute(
+          "leader $0 did not report consensus state for tablet $1",
+          leader_uuid, move.tablet_uuid));
+    }
+    cstate = resp.tablets(0).cstate();
+  }
+
+  const RaftPeerPB* src_peer = nullptr;
+  for (const auto& peer : cstate.committed_config().peers()) {
+    if (peer.permanent_uuid() == move.ts_uuid_from) {
+      src_peer = &peer;
+      break;
+    }
+  }
+  // Replica already gone from the config; nothing to clear.
+  if (!src_peer) {
+    return Status::NotFound(Substitute(
+        "replica $0 is no longer in tablet $1's config",
+        move.ts_uuid_from, move.tablet_uuid));
+  }
+  // Marker already cleared, so skip the no-op change and leave the config alone.
+  if (!src_peer->attrs().replace()) {
+    return Status::OK();
+  }
+
+  BulkChangeConfigRequestPB req;
+  auto* modify_peer = req.add_config_changes();
+  modify_peer->set_type(MODIFY_PEER);
+  *modify_peer->mutable_peer()->mutable_permanent_uuid() = move.ts_uuid_from;
+  modify_peer->mutable_peer()->mutable_attrs()->set_replace(false);
+  req.set_dest_uuid(leader_uuid);
+  req.set_tablet_id(move.tablet_uuid);
+  // CAS against the config we just read: if anyone changes it before this lands,
+  // the leader rejects us (CAS_FAILED) and we retry fresh instead of clobbering
+  // their change.
+  //
+  // The CAS narrows this window but does not fully close it. It proves the
+  // config did not change between the read above and this request, but it
+  // cannot prove the 'replace' marker we clear is the one our failed move set:
+  // another actor could have set 'replace' on this same replica at the same
+  // opid. That is more likely when we reach here from ProcessPendingReplaceClears()
+  // on a later RunLoop iteration, where more time has passed since the move
+  // failed. We accept this: a spurious clear cannot leave the tablet
+  // under-replicated forever, since the catalog re-replicates genuinely
+  // under-replicated tablets on its own, independent of the 'replace' attribute.
+  // At worst it delays a proactive replacement, which is retried.
+  req.set_cas_config_opid_index(cstate.committed_config().opid_index());
+
+  ChangeConfigResponsePB resp;
+  RpcController rpc;
+  rpc.set_timeout(MonoDelta::FromSeconds(FLAGS_auto_rebalancing_rpc_timeout_seconds));
+  RETURN_NOT_OK(proxy.BulkChangeConfig(req, &resp, &rpc));
+  if (resp.has_error()) {
+    return StatusFromPB(resp.error().status());
+  }
+  return Status::OK();
+}
+
+void AutoRebalancerTask::ProcessPendingReplaceClears() {
+  if (pending_replace_clears_.empty()) {
+    return;
+  }
+  // Without catalog leadership we can't resolve tablet leaders, and any
+  // marker we left behind is now the new leader's responsibility.
+  {
+    CatalogManager::ScopedLeaderSharedLock l(catalog_manager_);
+    if (!l.first_failed_status().ok()) {
+      return;
+    }
+  }
+  vector<Rebalancer::ReplicaMove> still_pending;
+  still_pending.reserve(pending_replace_clears_.size());
+  for (const auto& move : pending_replace_clears_) {
+    Status s = TryClearReplaceMarker(move);
+    if (s.ok() || s.IsNotFound() || s.IsInvalidArgument()) {
+      // Nothing left to do: cleared (OK, including the already-clear case) or
+      // the replica is gone from the config (NotFound).
+      continue;
+    }
+    still_pending.emplace_back(move);
+  }
+  pending_replace_clears_ = std::move(still_pending);
 }
 
 } // namespace master
