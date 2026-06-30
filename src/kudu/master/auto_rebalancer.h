@@ -168,6 +168,20 @@ class AutoRebalancerTask {
       const rebalance::Rebalancer::ReplicaMove& replica_move,
       bool* is_complete);
 
+  // Makes a single attempt to clear the source peer's replace marker for
+  // 'move', sending a MODIFY_PEER (replace=false) BulkChangeConfig to the
+  // tablet leader. Returns NotFound if the peer is already gone from the
+  // config, or InvalidArgument if the marker was already cleared; callers
+  // treat both as success.
+  Status TryClearReplaceMarker(const rebalance::Rebalancer::ReplicaMove& move);
+
+  // Retries the replace-marker cleanups that didn't succeed within the inline
+  // retry budget. Runs at the top of every RunLoop iteration, even when
+  // rebalancing is disabled, so a marker doesn't stay stuck just because the
+  // consensus state happened to be transient when we first tried (leader
+  // transfer, pending config change, connection refused, and so on).
+  void ProcessPendingReplaceClears();
+
   // The associated catalog manager.
   CatalogManager* catalog_manager_;
 
@@ -200,6 +214,11 @@ class AutoRebalancerTask {
   scoped_refptr<Counter> leader_moves_scheduled_;
   scoped_refptr<Counter> follower_moves_scheduled_;
   scoped_refptr<Counter> rounds_completed_;
+
+  // Replica moves whose replace-marker cleanup did not succeed within the
+  // inline retry budget. Reprocessed by ProcessPendingReplaceClears() at
+  // the top of every RunLoop iteration.
+  std::vector<rebalance::Rebalancer::ReplicaMove> pending_replace_clears_;
 
   // Variables for testing.
   std::atomic<int> number_of_loop_iterations_for_test_;

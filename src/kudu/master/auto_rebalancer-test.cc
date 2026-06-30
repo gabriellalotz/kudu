@@ -1235,30 +1235,61 @@ TEST_F(AutoRebalancerTest, TestRemoveReplaceFlagIfMoveFails) {
   // Stop the auto rebalancing after current loop.
   FLAGS_auto_rebalancing_enabled = false;
 
-  // Check all the replace markers are false.
-  ASSERT_EVENTUALLY([&] {
+  // Check all the replace markers are false. Give extra time for TSAN builds
+  // which are significantly slower. The GetConsensusState RPC loop is expensive.
+  const auto kTimeout = MonoDelta::FromSeconds(
+#ifdef THREAD_SANITIZER
+      180  // TSAN is ~5-10x slower
+#else
+      60
+#endif
+  );
+
+  AssertEventually([&] {
     for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
       const auto& tserver = cluster_->mini_tablet_server(i);
       const auto& tablet_ids = tserver->ListTablets();
-      for (const auto& tablet_id: tablet_ids) {
+      for (const auto& tablet_id : tablet_ids) {
         GetConsensusStateRequestPB req;
         GetConsensusStateResponsePB resp;
         RpcController controller;
-        controller.set_timeout(MonoDelta::FromSeconds(60));
+        controller.set_timeout(MonoDelta::FromSeconds(5));
         req.set_dest_uuid(tserver->uuid());
         req.add_tablet_ids(tablet_id);
         req.set_report_health(EXCLUDE_HEALTH_REPORT);
         ASSERT_OK(cluster_->tserver_consensus_proxy(i)->GetConsensusState(
             req, &resp, &controller));
 
-        const auto& committed_config = resp.tablets(0).cstate().committed_config();
+        // The tserver may no longer be hosting this tablet by the time the
+        // RPC is served (e.g. it was evicted and the replica was deleted
+        // between ListTablets() and now). Skip rather than indexing into an
+        // empty repeated field.
+        if (resp.tablets_size() == 0) continue;
+        const auto& cstate = resp.tablets(0).cstate();
+
+        // Only assert on the leader's view. Followers, and especially a freshly
+        // added NON_VOTER on a new tserver that joined just before being
+        // evicted, can hold a stale committed_config that never saw the
+        // master's cleanup MODIFY_PEER op clear the marker.
+        if (cstate.leader_uuid() != tserver->uuid()) continue;
+
+        const auto& committed_config = cstate.committed_config();
         for (int p = 0; p < committed_config.peers_size(); p++) {
           const auto& peer = committed_config.peers(p);
-          ASSERT_FALSE(peer.attrs().replace());
+          ASSERT_FALSE(peer.attrs().replace())
+              << "ts_idx=" << i
+              << " ts_uuid=" << tserver->uuid()
+              << " tablet_id=" << tablet_id
+              << " peer_uuid=" << peer.permanent_uuid()
+              << " peer_member_type="
+              << consensus::RaftPeerPB::MemberType_Name(peer.member_type())
+              << " committed_opid_index=" << committed_config.opid_index()
+              << " current_term=" << cstate.current_term();
         }
       }
     }
-  });
+  }, kTimeout);
+  NO_PENDING_FATALS();
 }
 
 // Rebalancer::BuildClusterInfo() fills ClusterInfo::ts_with_followers_by_table_and_tag
