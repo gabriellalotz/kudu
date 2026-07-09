@@ -358,17 +358,22 @@ void WriteOp::Finish(OpResult result) {
       if (state()->external_consistency_mode() == COMMIT_WAIT) {
         metrics->commit_wait_duration->Increment(op_m.commit_wait_duration_usec);
       }
-      uint64_t op_duration_usec =
+      // A negative delta (e.g. from a racy start_time under heavy load) would
+      // wrap through uint64 and trip the histogram's value >= 0 CHECK, aborting
+      // the server. Recording a duration metric must never crash the process.
+      const int64_t op_duration_usec =
           (MonoTime::Now() - state_->start_time()).ToMicroseconds();
-      switch (state()->external_consistency_mode()) {
-        case CLIENT_PROPAGATED:
-          metrics->write_op_duration_client_propagated_consistency->Increment(op_duration_usec);
-          break;
-        case COMMIT_WAIT:
-          metrics->write_op_duration_commit_wait_consistency->Increment(op_duration_usec);
-          break;
-        case UNKNOWN_EXTERNAL_CONSISTENCY_MODE:
-          break;
+      if (PREDICT_TRUE(op_duration_usec >= 0)) {
+        switch (state()->external_consistency_mode()) {
+          case CLIENT_PROPAGATED:
+            metrics->write_op_duration_client_propagated_consistency->Increment(op_duration_usec);
+            break;
+          case COMMIT_WAIT:
+            metrics->write_op_duration_commit_wait_consistency->Increment(op_duration_usec);
+            break;
+          case UNKNOWN_EXTERNAL_CONSISTENCY_MODE:
+            break;
+        }
       }
     }
   }

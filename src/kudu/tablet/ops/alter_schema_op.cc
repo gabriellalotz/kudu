@@ -161,9 +161,14 @@ void AlterSchemaOp::Finish(OpResult result) {
   auto update_metrics = MakeScopedCleanup([&]() {
     if (auto* metrics = state_->tablet_replica()->tablet()->metrics();
         PREDICT_TRUE(metrics != nullptr && state_->start_time().Initialized())) {
-        uint64_t op_duration_usec =
+        // A negative delta (e.g. from a racy start_time under heavy load) would
+        // wrap through uint64 and trip the histogram's value >= 0 CHECK, aborting
+        // the server. Recording a duration metric must never crash the process.
+        const int64_t op_duration_usec =
             (MonoTime::Now() - state_->start_time()).ToMicroseconds();
-        metrics->alter_schema_duration->Increment(op_duration_usec);
+        if (PREDICT_TRUE(op_duration_usec >= 0)) {
+          metrics->alter_schema_duration->Increment(op_duration_usec);
+        }
     }
   });
 

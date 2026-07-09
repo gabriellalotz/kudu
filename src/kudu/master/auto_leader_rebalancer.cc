@@ -431,9 +431,21 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalanceForTable(
     }
 
     vector<Sockaddr> resolved;
-    RETURN_NOT_OK(host_port->ResolveAddresses(&resolved));
+    if (Status s = host_port->ResolveAddresses(&resolved); !s.ok()) {
+      WARN_NOT_OK(s, Substitute("leader transfer for tablet $0: could not resolve $1",
+                                task.first, host_port->ToString()));
+      continue;
+    }
     ConsensusServiceProxy proxy(messenger_, resolved[0], host_port->host());
-    RETURN_NOT_OK(proxy.LeaderStepDown(request, &response, &rpc));
+    // A single leader transfer is best effort. A transient failure (an RPC
+    // timeout, the target briefly unavailable, or an election in flight) should
+    // not abort the whole rebalancing pass and skip the remaining tablets and
+    // tables; the next round recomputes and retries.
+    if (Status s = proxy.LeaderStepDown(request, &response, &rpc); !s.ok()) {
+      WARN_NOT_OK(s, Substitute("leader transfer for tablet $0 from $1 to $2 failed",
+                                task.first, leader_uuid, task.second.second));
+      continue;
+    }
     leader_transfer_count++;
     if (!response.has_error()) {
       VLOG(1) << Substitute("leader transfer table: $0, tablet_id: $1, from: $2 to: $3",

@@ -17,7 +17,9 @@
 
 #include "kudu/util/net/dns_resolver.h"
 
+#include <atomic>
 #include <memory>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -52,6 +54,30 @@ using std::unique_ptr;
 using std::vector;
 
 namespace kudu {
+
+namespace {
+// Wraps a StatusCallback so it runs exactly once: either explicitly via Run(),
+// or with an error from the destructor if Run() was never called. The resolver
+// hands async work to a threadpool, and on shutdown a queued task can be dropped
+// before it runs. Some callers hold resources until their callback fires (e.g.
+// an in-flight consensus LeaderElection whose destructor CHECKs that its
+// decision callback ran), so the callback must never be silently dropped.
+class GuaranteedCallback {
+ public:
+  explicit GuaranteedCallback(StatusCallback cb) : cb_(std::move(cb)) {}
+  ~GuaranteedCallback() {
+    Run(Status::ServiceUnavailable("DNS resolution task was abandoned"));
+  }
+  void Run(const Status& s) {
+    if (!fired_.test_and_set(std::memory_order_acq_rel)) {
+      cb_(s);
+    }
+  }
+ private:
+  const StatusCallback cb_;
+  std::atomic_flag fired_ = ATOMIC_FLAG_INIT;
+};
+}  // anonymous namespace
 
 DnsResolver::DnsResolver(int max_threads_num,
                          size_t cache_capacity_bytes,
@@ -88,11 +114,13 @@ void DnsResolver::ResolveAddressesAsync(const HostPort& hostport,
   if (GetCachedAddresses(hostport, addresses)) {
     return cb(Status::OK());
   }
-  const auto s = pool_->Submit([=]() {
-    this->DoResolutionCb(hostport, addresses, cb);
+  auto guarantee = std::make_shared<GuaranteedCallback>(cb);
+  const auto s = pool_->Submit([this, hostport, addresses, guarantee]() {
+    this->DoResolutionCb(hostport, addresses,
+        [guarantee](const Status& s) { guarantee->Run(s); });
   });
   if (PREDICT_FALSE(!s.ok())) {
-    cb(s);
+    guarantee->Run(s);
   }
 }
 
@@ -102,17 +130,19 @@ void DnsResolver::RefreshAddressesAsync(const HostPort& hostport,
   if (PREDICT_TRUE(cache_)) {
     cache_->Erase(hostport.host());
   }
-  const auto s = pool_->Submit([=]() {
+  auto guarantee = std::make_shared<GuaranteedCallback>(cb);
+  const auto s = pool_->Submit([this, hostport, addresses, guarantee]() {
     // Before performing the resolution, check if another task has already
     // resolved it and cached a new entry.
     if (this->GetCachedAddresses(hostport, addresses)) {
-      cb(Status::OK());
+      guarantee->Run(Status::OK());
       return;
     }
-    this->DoResolutionCb(hostport, addresses, cb);
+    this->DoResolutionCb(hostport, addresses,
+        [guarantee](const Status& s) { guarantee->Run(s); });
   });
   if (PREDICT_FALSE(!s.ok())) {
-    cb(s);
+    guarantee->Run(s);
   }
 }
 
