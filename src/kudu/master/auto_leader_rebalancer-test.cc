@@ -52,6 +52,7 @@
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/tserver/mini_tablet_server.h"
 #include "kudu/tserver/tserver_service.proxy.h" // IWYU pragma: keep
+#include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
@@ -86,6 +87,11 @@ DECLARE_uint32(auto_rebalancing_max_moves_per_server);
 DECLARE_uint32(auto_rebalancing_wait_for_replica_moves_seconds);
 DECLARE_uint32(leader_rebalancing_max_moves_per_round);
 DECLARE_bool(auto_leader_rebalancing_fail_moves_for_test);
+
+METRIC_DECLARE_counter(auto_leader_rebalancer_moves_scheduled);
+METRIC_DECLARE_counter(auto_leader_rebalancer_moves_failed);
+METRIC_DECLARE_counter(auto_leader_rebalancer_rounds_completed);
+METRIC_DECLARE_counter(auto_leader_rebalancer_global_pass_skipped);
 
 namespace kudu {
 namespace master {
@@ -301,6 +307,14 @@ class LeaderRebalancerTest : public KuduTest {
   int MovesScheduledLastRound() {
     return cluster_->mini_master()->master()->catalog_manager()
         ->auto_leader_rebalancer()->moves_scheduled_this_round_for_test_.load();
+  }
+
+  // Returns the current value of a server-scoped counter on the leader master.
+  // Instantiate() is idempotent: it returns the existing counter registered by
+  // the AutoLeaderRebalancerTask constructor rather than a fresh zero one.
+  int64_t GetLeaderMasterCounterValue(CounterPrototype* prototype) const {
+    return prototype->Instantiate(
+        cluster_->mini_master()->master()->metric_entity())->value();
   }
 
   // Sums each tserver's leader count across all of 'table_names'.
@@ -1155,6 +1169,68 @@ TEST_P(FilterSoftDeletedTableTest, TestFilterSofteDeletedTable) {
     }, MonoDelta::FromSeconds(kLeaderBalanceTimeoutSeconds));
     NO_PENDING_FATALS();
   }
+}
+
+// Covers the four counters wired in auto_leader_rebalancer.cc:
+//   * rounds_completed advances each time RunLeaderRebalancer runs on the leader
+//   * moves_scheduled advances on a round that plans transfers
+//   * moves_failed advances when RPCs are forced to fail
+//   * global_pass_skipped advances on a round where per-table balancing was busy
+TEST_F(LeaderRebalancerTest, RebalancerMetrics) {
+  const int kNumTServers = 3;
+  const int kNumTablets = 6;
+  cluster_opts_.num_tablet_servers = kNumTServers;
+  ASSERT_OK(CreateAndStartCluster());
+  CreateWorkloadTable(kNumTablets, /*num_replicas*/ 3);
+
+  // Pile every leader onto ts0 so the rebalancer has transfers to schedule and
+  // per-table balancing has work this round.
+  const string ts0_uuid = cluster_->mini_tablet_server(0)->uuid();
+  ASSERT_OK(MakeLeaderDistribution({kNumTablets, 0, 0}, table_name()));
+  using LeaderMap = std::map<string, int32_t>;
+  ASSERT_EVENTUALLY([&] {
+    LeaderMap leader_map;
+    ASSERT_OK(GetLeaderDistribution(&leader_map, table_name()));
+    ASSERT_GT(leader_map[ts0_uuid], kNumTablets / kNumTServers);
+  });
+
+  master::AutoLeaderRebalancerTask* leader_rebalancer =
+      cluster_->mini_master()->master()->catalog_manager()->auto_leader_rebalancer();
+
+  // Round 1: force every step-down to fail. Moves are planned (so
+  // per-table balancing is busy), each RPC fails, and the global pass is
+  // skipped because per-table still had work to schedule.
+  const int64_t rounds_before = GetLeaderMasterCounterValue(
+      &METRIC_auto_leader_rebalancer_rounds_completed);
+  const int64_t scheduled_before = GetLeaderMasterCounterValue(
+      &METRIC_auto_leader_rebalancer_moves_scheduled);
+  const int64_t failed_before = GetLeaderMasterCounterValue(
+      &METRIC_auto_leader_rebalancer_moves_failed);
+  const int64_t skipped_before = GetLeaderMasterCounterValue(
+      &METRIC_auto_leader_rebalancer_global_pass_skipped);
+
+  FLAGS_auto_leader_rebalancing_fail_moves_for_test = true;
+  ASSERT_OK(leader_rebalancer->RunLeaderRebalancer());
+
+  ASSERT_EQ(rounds_before + 1, GetLeaderMasterCounterValue(
+      &METRIC_auto_leader_rebalancer_rounds_completed));
+  ASSERT_GT(GetLeaderMasterCounterValue(
+      &METRIC_auto_leader_rebalancer_moves_failed), failed_before);
+  // No successful moves this round: every RPC was forced to fail.
+  ASSERT_EQ(scheduled_before, GetLeaderMasterCounterValue(
+      &METRIC_auto_leader_rebalancer_moves_scheduled));
+  // Per-table balancing scheduled moves, so the global pass was gated off.
+  ASSERT_EQ(skipped_before + 1, GetLeaderMasterCounterValue(
+      &METRIC_auto_leader_rebalancer_global_pass_skipped));
+
+  // Round 2+: allow moves to succeed. Rerun until moves_scheduled advances,
+  // proving successful transfers are counted.
+  FLAGS_auto_leader_rebalancing_fail_moves_for_test = false;
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_OK(leader_rebalancer->RunLeaderRebalancer());
+    ASSERT_GT(GetLeaderMasterCounterValue(
+        &METRIC_auto_leader_rebalancer_moves_scheduled), scheduled_before);
+  });
 }
 
 }  // namespace master
