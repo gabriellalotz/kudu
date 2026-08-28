@@ -36,6 +36,7 @@
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/fs/error_manager.h"
 #include "kudu/fs/fs_manager.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/split.h"
@@ -47,8 +48,8 @@
 #include "kudu/master/master.proxy.h"
 #include "kudu/master/master_cert_authority.h"
 #include "kudu/master/master_path_handlers.h"
-#include "kudu/master/rest_catalog_path_handlers.h"
 #include "kudu/master/master_service.h"
+#include "kudu/master/rest_catalog_path_handlers.h"
 #include "kudu/master/ts_manager.h"
 #include "kudu/master/txn_manager.h"
 #include "kudu/master/txn_manager_service.h"
@@ -139,11 +140,13 @@ DEFINE_bool(enable_rest_api,
             "set to true for this flag to take effect.");
 TAG_FLAG(enable_rest_api, advanced);
 
+DECLARE_bool(rest_api_allow_anonymous);
 DECLARE_bool(txn_manager_lazily_initialized);
 DECLARE_bool(txn_manager_enabled);
 DECLARE_string(master_addresses);
 DECLARE_string(rpc_proxy_advertised_addresses);
 DECLARE_bool(webserver_enabled);
+DECLARE_bool(webserver_require_spnego);
 
 using kudu::consensus::RaftPeerPB;
 using kudu::fs::ErrorHandlerType;
@@ -179,6 +182,15 @@ bool ValidateRestApiFlag() {
   if (FLAGS_enable_rest_api && !FLAGS_webserver_enabled) {
     LOG(ERROR) << "REST API endpoints cannot be enabled when webserver is disabled. "
                << "Please set --webserver_enabled=true to use REST API.";
+    return false;
+  }
+  if (FLAGS_enable_rest_api && !FLAGS_webserver_require_spnego &&
+      !FLAGS_rest_api_allow_anonymous) {
+    LOG(ERROR) << "REST API endpoints perform catalog operations as the "
+               << "authenticated web principal and cannot be enabled without "
+               << "webserver authentication. Please set "
+               << "--webserver_require_spnego=true to use REST API (or, for "
+               << "testing only, --rest_api_allow_anonymous=true).";
     return false;
   }
   return true;

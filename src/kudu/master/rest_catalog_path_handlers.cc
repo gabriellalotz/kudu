@@ -70,6 +70,15 @@ DEFINE_int32(rest_catalog_default_request_timeout_ms, 30 * 1000, "Default reques
 TAG_FLAG(rest_catalog_default_request_timeout_ms, advanced);
 TAG_FLAG(rest_catalog_default_request_timeout_ms, runtime);
 
+DEFINE_bool(rest_api_allow_anonymous, false,
+            "Whether the REST catalog API accepts requests that carry no "
+            "authenticated web principal, executing them as the synthetic "
+            "user 'default'. This is unsafe: with anonymous access enabled, "
+            "anyone able to reach the master webserver port can perform DDL "
+            "operations. Only intended for testing.");
+TAG_FLAG(rest_api_allow_anonymous, unsafe);
+TAG_FLAG(rest_api_allow_anonymous, runtime);
+
 using google::protobuf::util::JsonParseOptions;
 using google::protobuf::util::JsonStringToMessage;
 using kudu::consensus::RaftPeerPB;
@@ -95,6 +104,34 @@ static bool CheckIsInitializedAndIsLeader(JsonWriter& jw,  // NOLINT JsonWriter 
         jw, "Master is not the leader", status_code, HttpStatusCode::ServiceUnavailable, false);
   }
   return true;
+}
+
+// Resolves the acting user for a REST catalog request. Returns true and sets
+// 'user' if the request carries an authenticated principal (or anonymous
+// access is explicitly enabled); otherwise writes a JSON 401 error and
+// returns false. Never fabricate an identity for an unauthenticated caller:
+// catalog operations must not execute as the synthetic user "default" unless
+// the operator explicitly opted into --rest_api_allow_anonymous.
+static bool ResolveRequestUser(JsonWriter& jw,  // NOLINT JsonWriter cannot be const
+                               const Webserver::WebRequest& req,
+                               HttpStatusCode& status_code,  // NOLINT
+                               optional<string>* user) {
+  if (!req.username.empty()) {
+    *user = req.username;
+    return true;
+  }
+  if (FLAGS_rest_api_allow_anonymous) {
+    *user = "default";
+    return true;
+  }
+  RETURN_JSON_ERROR_VAL(jw,
+                        "Authentication required: this request carries no "
+                        "authenticated principal. Enable webserver "
+                        "authentication (e.g. --webserver_require_spnego) to "
+                        "use the REST catalog API",
+                        status_code,
+                        HttpStatusCode::AuthenticationRequired,
+                        false);
 }
 
 static HttpStatusCode GetHttpCodeFromStatus(const Status& status) {
@@ -263,9 +300,12 @@ void RestCatalogPathHandlers::HandleGetTables(std::ostringstream* output,
                                               HttpStatusCode* status_code) {
   ListTablesRequestPB request;
   ListTablesResponsePB response;
-  optional<string> user = req.username.empty() ? "default" : req.username;
-  Status status = master_->catalog_manager()->ListTables(&request, &response, user);
   JsonWriter jw(output, JsonWriter::COMPACT);
+  optional<string> user;
+  if (!ResolveRequestUser(jw, req, *status_code, &user)) {
+    return;
+  }
+  Status status = master_->catalog_manager()->ListTables(&request, &response, user);
 
   if (!status.ok()) {
     RETURN_JSON_ERROR_FROM_STATUS(jw, status, *status_code);
@@ -294,6 +334,13 @@ void RestCatalogPathHandlers::HandlePostTables(ostringstream* output,
   CreateTableResponsePB response;
   JsonWriter jw(output, JsonWriter::COMPACT);
 
+  // Check auth before parsing the body so unauthenticated callers cannot
+  // probe the expected JSON schema by comparing 400 vs 401 responses.
+  optional<string> user;
+  if (!ResolveRequestUser(jw, req, *status_code, &user)) {
+    return;
+  }
+
   const string& json_str = req.post_data;
   JsonParseOptions opts;
   opts.case_insensitive_enum_parsing = true;
@@ -305,7 +352,6 @@ void RestCatalogPathHandlers::HandlePostTables(ostringstream* output,
                       *status_code,
                       HttpStatusCode::BadRequest);
   }
-  optional<string> user = req.username.empty() ? "default" : req.username;
   Status status = master_->catalog_manager()->CreateTableWithUser(&request, &response, user);
 
   if (!status.ok()) {
@@ -362,6 +408,13 @@ void RestCatalogPathHandlers::HandlePutTable(ostringstream* output,
   request.mutable_table()->set_table_id(table_id);
   JsonWriter jw(output, JsonWriter::COMPACT);
 
+  // Check auth before parsing the body so unauthenticated callers cannot
+  // probe the expected JSON schema by comparing 400 vs 401 responses.
+  optional<string> user;
+  if (!ResolveRequestUser(jw, req, *status_code, &user)) {
+    return;
+  }
+
   const string& json_str = req.post_data;
   JsonParseOptions opts;
   opts.case_insensitive_enum_parsing = true;
@@ -374,7 +427,6 @@ void RestCatalogPathHandlers::HandlePutTable(ostringstream* output,
                       HttpStatusCode::BadRequest);
   }
 
-  optional<string> user = req.username.empty() ? "default" : req.username;
   Status status = master_->catalog_manager()->AlterTableWithUser(request, &response, user);
 
   if (!status.ok()) {
@@ -422,7 +474,10 @@ void RestCatalogPathHandlers::HandleDeleteTable(ostringstream* output,
   DeleteTableResponsePB response;
   request.mutable_table()->set_table_id(table_id);
   JsonWriter jw(output, JsonWriter::COMPACT);
-  optional<string> user = req.username.empty() ? "default" : req.username;
+  optional<string> user;
+  if (!ResolveRequestUser(jw, req, *status_code, &user)) {
+    return;
+  }
   Status status = master_->catalog_manager()->DeleteTableWithUser(request, &response, user);
 
   if (status.ok()) {
