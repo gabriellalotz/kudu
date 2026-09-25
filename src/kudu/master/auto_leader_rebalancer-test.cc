@@ -130,11 +130,17 @@ class LeaderRebalancerTest : public KuduTest {
 
   std::string table_name() { return workload_->table_name(); }
 
-  // Exposes the task's private test counter (the fixture is a friend of the
+  // Exposes the task's private test counters (the fixture is a friend of the
   // task, individual TEST_F bodies are not).
   int MovesScheduledThisRoundForTest() {
     return cluster_->mini_master()->master()->catalog_manager()
         ->auto_leader_rebalancer()->moves_scheduled_this_round_for_test_;
+  }
+
+  // Counts only the passes that got past the leadership check.
+  int NumLoopIterations() {
+    return cluster_->mini_master()->master()->catalog_manager()
+        ->auto_leader_rebalancer()->number_of_loop_iterations_for_test_;
   }
 
   Status RunLeaderRebalanceForTable(
@@ -1257,6 +1263,24 @@ TEST_F(LeaderRebalancerTest, RebalancerMetrics) {
     ASSERT_OK(leader_rebalancer->RunLeaderRebalancer());
     ASSERT_GT(GetLeaderMasterCounterValue(
         &METRIC_auto_leader_rebalancer_moves_completed), completed_before);
+  });
+}
+
+// The loop must run its first pass as soon as this master is leader-ready, not
+// an interval later: at the production default below, a master that sleeps the
+// interval first is idle for an hour after startup or failover.
+TEST_F(LeaderRebalancerTest, FirstPassDoesNotWaitOutFullInterval) {
+  const int kNumTServers = 3;
+  const int kNumTablets = 6;
+  cluster_opts_.num_tablet_servers = kNumTServers;
+  ASSERT_OK(CreateAndStartCluster());
+  CreateWorkloadTable(kNumTablets, /*num_replicas*/ 3);
+
+  FLAGS_auto_leader_rebalancing_interval_seconds = 3600;
+  FLAGS_auto_leader_rebalancing_enabled = true;
+
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_LT(0, NumLoopIterations());
   });
 }
 

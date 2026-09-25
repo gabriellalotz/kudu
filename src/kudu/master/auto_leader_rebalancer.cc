@@ -846,8 +846,12 @@ Status AutoLeaderRebalancerTask::RunGlobalLeaderRebalance(
   return Status::OK();
 }
 
-Status AutoLeaderRebalancerTask::RunLeaderRebalancer() {
+Status AutoLeaderRebalancerTask::RunLeaderRebalancer(bool* ran) {
   std::lock_guard guard(running_mutex_);
+
+  if (ran) {
+    *ran = false;
+  }
 
   // If catalog manager isn't initialized or isn't the leader, don't do leader
   // rebalancing. Putting the auto-rebalancer to sleep shouldn't affect the
@@ -861,6 +865,9 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalancer() {
     }
   }
 
+  if (ran) {
+    *ran = true;
+  }
   number_of_loop_iterations_for_test_++;
 
   // Leader balance need not disk capacity, so
@@ -955,20 +962,40 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalancer() {
 }
 
 void AutoLeaderRebalancerTask::RunLoop() {
-  while (
-      !shutdown_.WaitFor(MonoDelta::FromSeconds(FLAGS_auto_leader_rebalancing_interval_seconds))) {
-    if (FLAGS_auto_leader_rebalancing_enabled) {
+  // Poll much more often than --auto_leader_rebalancing_interval_seconds, which
+  // says how often to rebalance, not how long to sleep. Polling is what lets
+  // the loop notice it has become leader-ready (which happens well after this
+  // thread starts, at the end of CatalogManager::PrepareForLeadershipTask())
+  // rather than an interval -- an hour, by default -- later.
+  static constexpr uint32_t kPollIntervalSecs = 5;
+
+  MonoTime last_run_time;
+
+  do {
+    const bool pass_is_due =
+        FLAGS_auto_leader_rebalancing_enabled &&
+        (!last_run_time.Initialized() ||
+         MonoTime::Now() - last_run_time >=
+             MonoDelta::FromSeconds(FLAGS_auto_leader_rebalancing_interval_seconds));
+    if (pass_is_due) {
       // RunLeaderRebalancer() normalises the "we're not the catalog-manager
       // leader" cases to Status::OK(), so any non-OK reaching here is an
       // unexpected failure worth surfacing to both the log and the
       // warning-severity 'auto_leader_rebalancer_task_errors' counter.
-      const Status s = RunLeaderRebalancer();
+      bool ran = false;
+      const Status s = RunLeaderRebalancer(&ran);
       if (PREDICT_FALSE(!s.ok())) {
         task_errors_->Increment();
         WARN_NOT_OK(s, "auto-leader-rebalancer round failed");
       }
+      // Only a pass that actually happened starts the interval clock; one
+      // skipped for want of leadership is retried on the next poll.
+      if (ran) {
+        last_run_time = MonoTime::Now();
+      }
     }
-  }
+  } while (!shutdown_.WaitFor(MonoDelta::FromSeconds(
+      std::min(kPollIntervalSecs, FLAGS_auto_leader_rebalancing_interval_seconds))));
 }
 
 }  // namespace master
