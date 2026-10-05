@@ -494,7 +494,11 @@ Status AutoRebalancerTask::GetMovesUsingRebalancingAlgo(
                                       is_leader_move));
   }
 
-  *replica_moves = std::move(rep_moves);
+  // Append rather than overwrite: GetMoves() accumulates several passes into
+  // this one vector, and the budget above is charged against what it holds.
+  for (auto& m : rep_moves) {
+    replica_moves->emplace_back(std::move(m));
+  }
   return Status::OK();
 }
 

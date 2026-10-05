@@ -346,6 +346,16 @@ class AutoRebalancerTest : public KuduTest {
         raw_info, moves_in_progress, cluster_info);
   }
 
+  static Status GetMovesUsingRebalancingAlgoForTest(
+      AutoRebalancerTask* auto_rebalancer,
+      const rebalance::ClusterRawInfo& raw_info,
+      rebalance::RebalancingAlgo* algo,
+      CrossLocations cross_location,
+      vector<rebalance::Rebalancer::ReplicaMove>* replica_moves) {
+    return auto_rebalancer->GetMovesUsingRebalancingAlgo(
+        raw_info, algo, cross_location, replica_moves);
+  }
+
   static map<string, int> ComputeRangeReplicaSkew(
       const rebalance::ClusterRawInfo& raw_info,
       const string& table_id) {
@@ -1719,6 +1729,91 @@ TEST_F(AutoRebalancerTest, ExecuteMovesCASRejectionDropsMoveGracefully) {
     ASSERT_EQ(0, MovesPerTserver(rebalancer, dst_ts_uuid));
     ASSERT_STRINGS_ANY_MATCH(sink.logged_msgs(), "Failed to schedule move for tablet");
   });
+  NO_PENDING_FATALS();
+}
+
+// GetMoves() accumulates the cross-location and per-location passes into one
+// vector, so GetMovesUsingRebalancingAlgo must add to 'replica_moves' rather
+// than overwrite it, as auto_rebalancer.h documents.
+TEST_F(AutoRebalancerTest, GetMovesUsingRebalancingAlgoAppendsToMoveList) {
+  // Drive a thread-less task so this does not race the live auto-rebalancer
+  // thread on moves_per_tserver_, which carries no lock.
+  flag_saver_ = make_unique<FlagSaver>();
+  FLAGS_auto_rebalancing_enabled = false;
+
+  const int kNumOrigTservers = 3;
+  const int kNumAdditionalTservers = 1;
+  const int kNumTablets = 6;
+
+  cluster_opts_.num_tablet_servers = kNumOrigTservers;
+  ASSERT_OK(CreateAndStartCluster(/*enable_leader_rebalance=*/false));
+
+  CreateWorkloadTable(kNumTablets, /*num_replicas*/3);
+
+  int leader_idx;
+  ASSERT_OK(cluster_->GetLeaderMasterIndex(&leader_idx));
+  auto* catalog = cluster_->mini_master(leader_idx)->master()->catalog_manager();
+  auto* auto_rebalancer = catalog->auto_rebalancer();
+  auto standalone = MakeStandaloneRebalancerForTest(
+      catalog, cluster_->mini_master(leader_idx)->master()->ts_manager(),
+      cluster_->mini_master(leader_idx)->master()->metric_entity(),
+      auto_rebalancer);
+  auto* rebalancer = standalone.get();
+
+  // Skew the cluster so the greedy algorithm has work to do: the added server
+  // comes up empty while the originals hold every replica.
+  for (int i = 0; i < kNumAdditionalTservers; ++i) {
+    ASSERT_OK(cluster_->AddTabletServer());
+  }
+  NO_FATALS(WaitForLiveTServerCount(kNumOrigTservers + kNumAdditionalTservers));
+
+  rebalance::ClusterRawInfo raw_info;
+  ASSERT_EVENTUALLY([&] {
+    raw_info = rebalance::ClusterRawInfo();
+    ASSERT_OK(BuildClusterRawInfoForTest(rebalancer, nullopt, &raw_info));
+    ASSERT_FALSE(raw_info.tablet_summaries.empty());
+  });
+
+  // Seed the accumulator so the budget (max_moves_per_server * num_tservers,
+  // less what the accumulator already holds) comes out to a single move. With a
+  // budget of one the algorithm proposes only its top choice, a feasible move
+  // onto the empty server, which keeps the test off the infeasible-move path
+  // that would otherwise abort the call depending on how PICK_RANDOM orders the
+  // later proposals. These moves stand in for an earlier pass and must survive.
+  const int kTotalTservers = kNumOrigTservers + kNumAdditionalTservers;
+  const int kSentinels =
+      static_cast<int>(FLAGS_auto_rebalancing_max_moves_per_server) * kTotalTservers - 1;
+
+  rebalance::Rebalancer::ReplicaMove sentinel;
+  sentinel.tablet_uuid = "sentinel-tablet";
+  sentinel.ts_uuid_from = "sentinel-from";
+  sentinel.ts_uuid_to = "sentinel-to";
+  vector<rebalance::Rebalancer::ReplicaMove> replica_moves(kSentinels, sentinel);
+
+  rebalance::TwoDimensionalGreedyAlgo algo(
+      rebalance::TwoDimensionalGreedyAlgo::EqualSkewOption::PICK_RANDOM,
+      FLAGS_auto_rebalancing_prefer_follower_replica_moves);
+  ASSERT_OK(GetMovesUsingRebalancingAlgoForTest(
+      rebalancer, raw_info, &algo, CrossLocations::NO, &replica_moves));
+
+  int sentinel_count = 0;
+  int real_move_count = 0;
+  for (const auto& move : replica_moves) {
+    if (move.ts_uuid_from == sentinel.ts_uuid_from) {
+      ++sentinel_count;
+    } else {
+      ++real_move_count;
+    }
+  }
+
+  // Guard against a vacuous pass: no moves means the append path is untested,
+  // which points at the setup rather than the code.
+  ASSERT_GE(real_move_count, 1)
+      << "cluster was not skewed enough to produce any rebalancing moves";
+
+  ASSERT_EQ(kSentinels, sentinel_count)
+      << "pre-existing moves were dropped; GetMovesUsingRebalancingAlgo "
+         "overwrote '*replica_moves' instead of appending to it";
   NO_PENDING_FATALS();
 }
 
