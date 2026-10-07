@@ -54,6 +54,7 @@
 #include "kudu/tserver/tserver_service.proxy.h" // IWYU pragma: keep
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
+#include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
@@ -147,13 +148,19 @@ class LeaderRebalancerTest : public KuduTest {
   }
 
   Status CheckLeaderBalance() {
+    return CheckLeaderBalance(table_name());
+  }
+
+  // Plans 'name' in TEST mode: OK if its leaders are balanced, IllegalState if
+  // it wants a leader transfer.
+  Status CheckLeaderBalance(const string& name) {
     // Leader master
     master::Master* master = cluster_->mini_master()->master();
     master::CatalogManager* catalog_manager = master->catalog_manager();
     scoped_refptr<master::TableInfo> table_info;
     {
       CatalogManager::ScopedLeaderSharedLock leaderlock(catalog_manager);
-      catalog_manager->GetTableInfoByName(table_name(), &table_info);
+      catalog_manager->GetTableInfoByName(name, &table_info);
     }
 
     TSDescriptorVector descriptors;
@@ -949,6 +956,68 @@ TEST_F(LeaderRebalancerTest, GlobalLeaderBalanceRespectsMaxMovesPerRound) {
   // later tests.
   FLAGS_leader_rebalancing_max_moves_per_round = saved_max_moves;
   ASSERT_EQ(1, scheduled);
+}
+
+// Regression test: --leader_rebalancing_max_moves_per_round used to apply per
+// table, so a round over N skewed tables could schedule up to N * cap transfers.
+// The cap is now shared by all tables in a round.
+TEST_F(LeaderRebalancerTest, LeaderRebalancingMaxMovesPerRoundIsPerRoundNotPerTable) {
+  constexpr int kNumTServers = 3;
+  constexpr int kNumTables = 4;
+  constexpr int kTabletsPerTable = 2;
+  constexpr int kMaxMovesPerRound = 1;
+
+  const auto saved_max_moves = FLAGS_leader_rebalancing_max_moves_per_round;
+  auto restore_flag = MakeScopedCleanup(
+      [&]() { FLAGS_leader_rebalancing_max_moves_per_round = saved_max_moves; });
+  FLAGS_leader_rebalancing_max_moves_per_round = kMaxMovesPerRound;
+  // Fail the step-downs so leadership stays as arranged below. A move is
+  // counted as scheduled before its RPC, so failed moves still count.
+  FLAGS_auto_leader_rebalancing_fail_moves_for_test = true;
+
+  cluster_opts_.num_tablet_servers = kNumTServers;
+  ASSERT_OK(CreateAndStartCluster());
+  // CreateAndStartCluster() turns the replica rebalancer on; switch it off.
+  FLAGS_auto_rebalancing_enabled = false;
+
+  // Two tablets per table, all led by ts0, leave ts0 above each table's
+  // ceiling of one leader, so every table wants a transfer.
+  vector<string> table_names;
+  for (int i = 0; i < kNumTables; i++) {
+    table_names.emplace_back(strings::Substitute("per_round_cap_table_$0", i));
+    workload_.reset(new TestWorkload(cluster_.get()));
+    workload_->set_table_name(table_names.back());
+    workload_->set_num_tablets(kTabletsPerTable);
+    workload_->set_num_replicas(3);
+    workload_->Setup();
+    ASSERT_OK(MakeLeaderDistribution({kTabletsPerTable, 0, 0}, table_names.back()));
+  }
+
+  // Wait until leadership settles and every table wants a transfer.
+  const string ts0_uuid = cluster_->mini_tablet_server(0)->uuid();
+  AssertEventually([&] {
+    for (const auto& name : table_names) {
+      std::map<string, int32_t> leader_map;
+      ASSERT_OK(GetLeaderDistribution(&leader_map, name));
+      ASSERT_EQ(kTabletsPerTable, leader_map.at(ts0_uuid)) << name;
+      const Status s = CheckLeaderBalance(name);
+      ASSERT_TRUE(s.IsIllegalState()) << name << ": " << s.ToString();
+    }
+  }, MonoDelta::FromSeconds(kLeaderBalanceTimeoutSeconds));
+  NO_PENDING_FATALS();
+
+  master::AutoLeaderRebalancerTask* leader_rebalancer =
+      cluster_->mini_master()->master()->catalog_manager()->auto_leader_rebalancer();
+  const int64_t scheduled_before = GetLeaderMasterCounterValue(
+      &METRIC_auto_leader_rebalancer_moves_scheduled);
+  ASSERT_OK(leader_rebalancer->RunLeaderRebalancer());
+  const int64_t scheduled = GetLeaderMasterCounterValue(
+      &METRIC_auto_leader_rebalancer_moves_scheduled) - scheduled_before;
+
+  ASSERT_EQ(kMaxMovesPerRound, scheduled)
+      << "one round scheduled " << scheduled << " transfers across "
+      << kNumTables << " skewed tables with the per-round cap at "
+      << kMaxMovesPerRound;
 }
 
 // The global pass is deferred to a later round whenever per-table balancing
