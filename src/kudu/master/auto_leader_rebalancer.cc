@@ -222,7 +222,8 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalanceForTable(
     const unordered_set<string>& exclude_dest_uuids,
     unordered_map<string, int>* global_leader_count,
     AutoLeaderRebalancerTask::ExecuteMode mode,
-    int* num_scheduled_moves) {
+    int* num_scheduled_moves,
+    int* remaining_moves) {
   LOG(INFO) << Substitute("leader rebalance for table $0", table_info->table_name());
   TableMetadataLock table_l(table_info.get(), LockMode::READ);
   const SysTablesEntryPB& table_data = table_info->metadata().state().pb;
@@ -359,8 +360,17 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalanceForTable(
 
   // Step 3.
   // Generate transfer task, <tablet_id, from_uuid, to_uuid>
+  //
+  // Plan at most what is left of the round's budget when the caller shares one
+  // across tables, otherwise fall back to the flag.
+  const size_t round_cap = remaining_moves
+      ? static_cast<size_t>(std::max(0, *remaining_moves))
+      : static_cast<size_t>(FLAGS_leader_rebalancing_max_moves_per_round);
   map<string, pair<string, string>> leader_transfer_tasks;
   for (const auto& from_info : leader_transfer_source) {
+    if (leader_transfer_tasks.size() >= round_cap) {
+      break;
+    }
     string leader_uuid = from_info.first;
     int32_t need_transfer_count = from_info.second;
     int32_t pick_count = 0;
@@ -449,7 +459,7 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalanceForTable(
         (*global_leader_count)[leader_uuid]--;
         (*global_leader_count)[dest_follower_uuid]++;
       }
-      if (leader_transfer_tasks.size() >= FLAGS_leader_rebalancing_max_moves_per_round) {
+      if (leader_transfer_tasks.size() >= round_cap) {
         break;
       }
       if (++pick_count == need_transfer_count) {
@@ -457,11 +467,16 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalanceForTable(
         break;
       }
     }
-    if (leader_transfer_tasks.size() >= FLAGS_leader_rebalancing_max_moves_per_round) {
+    if (leader_transfer_tasks.size() >= round_cap) {
       VLOG(1) << Substitute(
           "leader rebalance reach the upper limit: $0, try do left leader transfer tasks next "
-          "time", FLAGS_leader_rebalancing_max_moves_per_round);
+          "time", round_cap);
     }
+  }
+
+  // Charge the planned transfers to the round's budget so later tables see it.
+  if (remaining_moves) {
+    *remaining_moves -= static_cast<int>(leader_transfer_tasks.size());
   }
 
   if (PREDICT_FALSE(mode == AutoLeaderRebalancerTask::ExecuteMode::TEST)) {
@@ -915,11 +930,19 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalancer() {
     global_leader_count_by_ts_uuid[uuid] = 0;
   }
 
+  // One transfer budget shared by all tables, so the
+  // --leader_rebalancing_max_moves_per_round cap applies per round and not
+  // per table.
+  int remaining_moves = FLAGS_leader_rebalancing_max_moves_per_round;
   int per_table_moves_scheduled = 0;
   for (const auto& table_info : table_infos) {
+    if (remaining_moves <= 0) {
+      break;
+    }
     RETURN_NOT_OK(RunLeaderRebalanceForTable(
         table_info, tserver_uuids, exclude_dest_uuids, &global_leader_count_by_ts_uuid,
-        AutoLeaderRebalancerTask::ExecuteMode::NORMAL, &per_table_moves_scheduled));
+        AutoLeaderRebalancerTask::ExecuteMode::NORMAL, &per_table_moves_scheduled,
+        &remaining_moves));
   }
   // Every table is now balanced on its own, but the cluster can still be
   // globally skewed if one tserver kept getting the ceiling allocation across
