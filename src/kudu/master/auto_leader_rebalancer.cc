@@ -222,7 +222,8 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalanceForTable(
     const unordered_set<string>& exclude_dest_uuids,
     unordered_map<string, int>* global_leader_count,
     AutoLeaderRebalancerTask::ExecuteMode mode,
-    int* num_scheduled_moves) {
+    int* num_scheduled_moves,
+    int* remaining_moves) {
   LOG(INFO) << Substitute("leader rebalance for table $0", table_info->table_name());
   TableMetadataLock table_l(table_info.get(), LockMode::READ);
   const SysTablesEntryPB& table_data = table_info->metadata().state().pb;
@@ -359,8 +360,20 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalanceForTable(
 
   // Step 3.
   // Generate transfer task, <tablet_id, from_uuid, to_uuid>
+  //
+  // The transfer cap is per round, not per table. When the caller threads a
+  // shared 'remaining_moves' budget we plan at most that many transfers here;
+  // otherwise (e.g. a direct single-table call from a test) we fall back to the
+  // flag. Charging the budget below keeps RunLeaderRebalancer() from scheduling
+  // up to (table count * cap) transfers in a single round.
+  const size_t round_cap = remaining_moves
+      ? static_cast<size_t>(std::max(0, *remaining_moves))
+      : static_cast<size_t>(FLAGS_leader_rebalancing_max_moves_per_round);
   map<string, pair<string, string>> leader_transfer_tasks;
   for (const auto& from_info : leader_transfer_source) {
+    if (leader_transfer_tasks.size() >= round_cap) {
+      break;
+    }
     string leader_uuid = from_info.first;
     int32_t need_transfer_count = from_info.second;
     int32_t pick_count = 0;
@@ -449,7 +462,7 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalanceForTable(
         (*global_leader_count)[leader_uuid]--;
         (*global_leader_count)[dest_follower_uuid]++;
       }
-      if (leader_transfer_tasks.size() >= FLAGS_leader_rebalancing_max_moves_per_round) {
+      if (leader_transfer_tasks.size() >= round_cap) {
         break;
       }
       if (++pick_count == need_transfer_count) {
@@ -457,11 +470,19 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalanceForTable(
         break;
       }
     }
-    if (leader_transfer_tasks.size() >= FLAGS_leader_rebalancing_max_moves_per_round) {
+    if (leader_transfer_tasks.size() >= round_cap) {
       VLOG(1) << Substitute(
           "leader rebalance reach the upper limit: $0, try do left leader transfer tasks next "
           "time", FLAGS_leader_rebalancing_max_moves_per_round);
     }
+  }
+
+  // Charge this table's planned transfers against the shared per-round budget so
+  // the remaining tables in the round see the reduced headroom (and stop once it
+  // is exhausted). Done at planning time, mirroring the global pass, which keeps
+  // the moves actually attempted at or below the cap.
+  if (remaining_moves) {
+    *remaining_moves -= static_cast<int>(leader_transfer_tasks.size());
   }
 
   if (PREDICT_FALSE(mode == AutoLeaderRebalancerTask::ExecuteMode::TEST)) {
@@ -915,11 +936,21 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalancer() {
     global_leader_count_by_ts_uuid[uuid] = 0;
   }
 
+  // One transfer budget for the whole round, shared across every table so the
+  // --leader_rebalancing_max_moves_per_round cap is enforced per round rather
+  // than re-armed per table. The global corrective pass below runs only when
+  // per-table balancing scheduled nothing, so it never adds to this round's
+  // per-table total.
+  int remaining_moves = FLAGS_leader_rebalancing_max_moves_per_round;
   int per_table_moves_scheduled = 0;
   for (const auto& table_info : table_infos) {
+    if (remaining_moves <= 0) {
+      break;
+    }
     RETURN_NOT_OK(RunLeaderRebalanceForTable(
         table_info, tserver_uuids, exclude_dest_uuids, &global_leader_count_by_ts_uuid,
-        AutoLeaderRebalancerTask::ExecuteMode::NORMAL, &per_table_moves_scheduled));
+        AutoLeaderRebalancerTask::ExecuteMode::NORMAL, &per_table_moves_scheduled,
+        &remaining_moves));
   }
   // Every table is now balanced on its own, but the cluster can still be
   // globally skewed if one tserver kept getting the ceiling allocation across

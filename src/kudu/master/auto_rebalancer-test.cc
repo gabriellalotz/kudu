@@ -44,6 +44,7 @@
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/ref_counted.h"
+#include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/integration-tests/cluster_itest_util.h"
@@ -110,6 +111,7 @@ using std::vector;
 using strings::Substitute;
 
 DECLARE_bool(auto_leader_rebalancing_enabled);
+DECLARE_bool(auto_leader_rebalancing_fail_moves_for_test);
 DECLARE_bool(auto_rebalancing_prefer_follower_replica_moves);
 DECLARE_bool(auto_rebalancing_enabled);
 DECLARE_bool(auto_rebalancing_enable_range_rebalancing);
@@ -125,6 +127,7 @@ DECLARE_uint32(auto_leader_rebalancing_interval_seconds);
 DECLARE_uint32(auto_rebalancing_interval_seconds);
 DECLARE_uint32(auto_rebalancing_max_moves_per_server);
 DECLARE_uint32(auto_rebalancing_wait_for_replica_moves_seconds);
+DECLARE_uint32(leader_rebalancing_max_moves_per_round);
 
 METRIC_DECLARE_gauge_int32(tablet_copy_open_client_sessions);
 METRIC_DECLARE_counter(tablet_copy_bytes_fetched);
@@ -344,6 +347,26 @@ class AutoRebalancerTest : public KuduTest {
       const rebalance::Rebalancer::MovesInProgress& moves_in_progress = {}) {
     return auto_rebalancer->rebalancer_.BuildClusterInfo(
         raw_info, moves_in_progress, cluster_info);
+  }
+
+  static int64_t LeaderMovesScheduledForTest(
+      AutoLeaderRebalancerTask* leader_rebalancer) {
+    return leader_rebalancer->moves_scheduled_->value();
+  }
+
+  // Plans one table's leader-rebalancing pass in TEST mode: it selects moves
+  // but issues none, and returns IllegalState when the table wants at least one
+  // leader transfer. Lets a test confirm each table independently has work to
+  // do before asserting on the per-round cap.
+  static Status LeaderRebalanceForTableInTestMode(
+      AutoLeaderRebalancerTask* leader_rebalancer,
+      const scoped_refptr<TableInfo>& table_info,
+      const vector<string>& tserver_uuids) {
+    return leader_rebalancer->RunLeaderRebalanceForTable(
+        table_info, tserver_uuids, /*exclude_dest_uuids=*/{},
+        /*global_leader_count=*/nullptr,
+        AutoLeaderRebalancerTask::ExecuteMode::TEST,
+        /*num_scheduled_moves=*/nullptr);
   }
 
   static map<string, int> ComputeRangeReplicaSkew(
@@ -1719,6 +1742,157 @@ TEST_F(AutoRebalancerTest, ExecuteMovesCASRejectionDropsMoveGracefully) {
     ASSERT_EQ(0, MovesPerTserver(rebalancer, dst_ts_uuid));
     ASSERT_STRINGS_ANY_MATCH(sink.logged_msgs(), "Failed to schedule move for tablet");
   });
+  NO_PENDING_FATALS();
+}
+
+// Regression test for the per-round cap documented on the
+// --leader_rebalancing_max_moves_per_round flag ("Max count of leader transfer
+// when every leader rebalance runs"). The cap is checked against
+// 'leader_transfer_tasks', which is local to RunLeaderRebalanceForTable, so it
+// is re-armed for every table. RunLeaderRebalancer() calls that method once per
+// table with no cross-table budget, so a round over N independently skewed
+// tables can schedule up to N * cap transfers rather than cap. The global
+// corrective pass, by contrast, threads a single 'remaining_moves' budget
+// across all tables, which is the per-round behavior the flag name promises.
+TEST_F(AutoRebalancerTest, LeaderRebalancingMaxMovesPerRoundIsPerRoundNotPerTable) {
+  flag_saver_ = make_unique<FlagSaver>();
+  // Cap the round at a single transfer, so any table beyond the first that gets
+  // a move is proof the cap leaked across tables.
+  FLAGS_leader_rebalancing_max_moves_per_round = 1;
+  // Force the rebalancer's own step-down RPCs to fail so the measured round
+  // leaves leadership untouched. A move is counted as scheduled just before its
+  // RPC, so the count still reflects planning, while the leadership skew set up
+  // below stays put for a deterministic, repeatable count.
+  FLAGS_auto_leader_rebalancing_fail_moves_for_test = true;
+
+  const int kNumTservers = 3;
+  const int kNumTables = 4;
+  const int kTabletsPerTable = 2;
+
+  cluster_opts_.num_tablet_servers = kNumTservers;
+  // Drive the leader rebalancer by hand; no background leader thread.
+  ASSERT_OK(CreateAndStartCluster(/*enable_leader_rebalance=*/false));
+  // Replica counts stay balanced throughout (RF=3 over 3 tservers), so the
+  // replica rebalancer has nothing to do; disable it anyway so the round under
+  // test is the only thing touching the cluster.
+  FLAGS_auto_rebalancing_enabled = false;
+
+  NO_FATALS(WaitForLiveTServerCount(kNumTservers));
+
+  // Create several RF=3 tables, each with more than one tablet, so that a
+  // single tserver holding all of a table's leaders sits above that table's
+  // ceiling and wants to shed one.
+  vector<unique_ptr<TestWorkload>> workloads;
+  vector<string> table_names;
+  for (int i = 0; i < kNumTables; i++) {
+    unique_ptr<TestWorkload> w(new TestWorkload(cluster_.get()));
+    const string name = Substitute("per_round_cap_table_$0", i);
+    w->set_table_name(name);
+    w->set_num_tablets(kTabletsPerTable);
+    w->set_num_replicas(3);
+    w->Setup();
+    workloads.emplace_back(std::move(w));
+    table_names.emplace_back(name);
+  }
+
+  int leader_idx;
+  ASSERT_OK(cluster_->GetLeaderMasterIndex(&leader_idx));
+  auto* catalog = cluster_->mini_master(leader_idx)->master()->catalog_manager();
+  auto* ts_manager = cluster_->mini_master(leader_idx)->master()->ts_manager();
+  auto* leader_rebalancer = catalog->auto_leader_rebalancer();
+  ASSERT_TRUE(leader_rebalancer != nullptr);
+
+  // GetTableInfoByName requires the catalog leader lock held; fetch the
+  // TableInfos once here and reuse them below.
+  vector<scoped_refptr<TableInfo>> tables;
+  {
+    CatalogManager::ScopedLeaderSharedLock l(catalog);
+    ASSERT_OK(l.first_failed_status());
+    for (const auto& name : table_names) {
+      scoped_refptr<TableInfo> table_info;
+      catalog->GetTableInfoByName(name, &table_info);
+      ASSERT_TRUE(table_info != nullptr) << "table not found: " << name;
+      tables.emplace_back(std::move(table_info));
+    }
+  }
+
+  const auto kTimeout = MonoDelta::FromSeconds(
+#ifdef THREAD_SANITIZER
+      120
+#else
+      30
+#endif
+  );
+
+  unordered_map<string, itest::TServerDetails*> ts_map;
+  ASSERT_OK(itest::CreateTabletServerMap(
+      cluster_->master_proxy(), cluster_->messenger(), &ts_map));
+  auto ts_map_cleanup = MakeScopedCleanup([&]() { STLDeleteValues(&ts_map); });
+
+  // Herd every tablet's leadership onto the first tserver, so each table has one
+  // server above its ceiling and the other two at zero leaders for that table.
+  const string target_uuid = cluster_->mini_tablet_server(0)->uuid();
+  itest::TServerDetails* target_ts = FindOrDie(ts_map, target_uuid);
+  for (const auto& table_info : tables) {
+    vector<scoped_refptr<TabletInfo>> tablet_infos;
+    table_info->GetAllTablets(&tablet_infos);
+    ASSERT_EQ(kTabletsPerTable, tablet_infos.size());
+    for (const auto& tablet : tablet_infos) {
+      const string tablet_id = tablet->id();
+      itest::TServerDetails* leader = nullptr;
+      ASSERT_OK(itest::FindTabletLeader(ts_map, tablet_id, kTimeout, &leader));
+      if (leader->uuid() == target_uuid) {
+        continue;
+      }
+      ASSERT_OK(itest::LeaderStepDown(
+          leader, tablet_id, kTimeout, /*error=*/nullptr, target_uuid));
+      ASSERT_OK(itest::WaitUntilLeader(target_ts, tablet_id, kTimeout));
+    }
+  }
+
+  TSDescriptorVector descriptors;
+  ts_manager->GetAllDescriptors(&descriptors);
+  vector<string> tserver_uuids;
+  for (const auto& d : descriptors) {
+    if (d->PresumedDead()) {
+      continue;
+    }
+    tserver_uuids.emplace_back(d->permanent_uuid());
+  }
+  ASSERT_EQ(kNumTservers, tserver_uuids.size());
+
+  // Wait until the master's view reflects the concentrated leadership, then
+  // confirm every table independently wants a transfer. This is what makes the
+  // per-round assertion below non-vacuous: with the cap honored per round, only
+  // one of these kNumTables demands could be satisfied in a single round.
+  ASSERT_EVENTUALLY([&]() {
+    int tables_wanting_moves = 0;
+    for (const auto& table_info : tables) {
+      const Status s = LeaderRebalanceForTableInTestMode(
+          leader_rebalancer, table_info, tserver_uuids);
+      if (s.IsIllegalState()) {
+        tables_wanting_moves++;
+      } else {
+        ASSERT_OK(s);
+      }
+    }
+    ASSERT_EQ(kNumTables, tables_wanting_moves);
+  });
+
+  const int64_t scheduled_before = LeaderMovesScheduledForTest(leader_rebalancer);
+  ASSERT_OK(leader_rebalancer->RunLeaderRebalancer());
+  const int64_t scheduled =
+      LeaderMovesScheduledForTest(leader_rebalancer) - scheduled_before;
+
+  const int cap = FLAGS_leader_rebalancing_max_moves_per_round;
+  ASSERT_LE(scheduled, cap)
+      << "one leader-rebalancing round scheduled " << scheduled << " transfers "
+      << "across " << kNumTables << " independently skewed tables with the "
+      << "per-round cap set to " << cap << ". The cap is checked against "
+         "'leader_transfer_tasks', which is local to RunLeaderRebalanceForTable "
+         "and re-armed for every table; RunLeaderRebalancer() calls that method "
+         "once per table with no cross-table budget, so a round schedules up to "
+         "(table count * cap) transfers instead of cap.";
   NO_PENDING_FATALS();
 }
 
