@@ -103,3 +103,252 @@ updates or upserts.
 
 The metrics associated with this background task have the prefix
 `undo_delta_block`.
+
+[[auto_rebalancing]]
+== Automatic rebalancing
+
+Kudu masters can run two background tasks that keep the cluster balanced
+without operator involvement:
+
+* The _auto-rebalancer_ moves tablet replicas between tablet servers so that
+  each table, and the cluster as a whole, has roughly the same number of
+  replicas on every tablet server. It is enabled with
+  `--auto_rebalancing_enabled`.
+* The _auto-leader-rebalancer_ moves Raft leadership between the existing
+  replicas of each tablet so that leaders, and with them most of the read and
+  write load, are spread evenly across tablet servers. It doesn't move any
+  data. It is enabled with `--auto_leader_rebalancing_enabled`.
+
+Both tasks are disabled by default. They run on every master, but only the
+leader master does any work; the others sleep until they become the leader.
+Both enable flags are experimental, so the masters also need
+`--unlock_experimental_flags`, otherwise a master started with either flag
+set to `true` refuses to start, and enabling either one with
+`kudu master set_flag` is rejected. With that set, both enable flags can be
+changed at runtime with `kudu master set_flag`. Since the leader can change,
+set them on every master (and in the masters' flag files so the setting
+survives a restart).
+
+The two tasks are independent and can be enabled separately, but they work
+well together. Moving a replica can change which tablet server leads a tablet,
+so the leader distribution may drift while the auto-rebalancer is working. The
+auto-leader-rebalancer evens it out again in a later round.
+
+[[auto_rebalancing_cli]]
+=== Relation to the CLI rebalancing tool
+
+The `kudu cluster rebalance` tool described in
+link:administration.html#rebalancer_tool[Running the tablet rebalancing tool]
+and the auto-rebalancer use the same rebalancing algorithms and the same way of
+moving replicas: the source replica is marked for replacement, a new replica is
+added on the destination tablet server, and the source replica is evicted once
+the new one has caught up. The difference is how they run. The CLI tool is a
+one-off session that runs until the cluster is balanced (or until
+`--max_run_time_sec` passes), while the auto-rebalancer keeps checking the
+cluster at a fixed interval and makes a small batch of moves each time.
+
+The CLI tool also covers a few cases the auto-rebalancer doesn't, such as
+moving replicas off tablet servers listed in `--ignored_tservers` when
+link:administration.html#tablet_server_decommissioning[decommissioning tablet servers].
+On an existing cluster with a lot of skew, it's a good idea to run the CLI tool
+once before enabling the auto-rebalancer, so the cluster starts out balanced
+and the auto-rebalancer only has to deal with smaller changes.
+
+The CLI tool only moves replicas; it doesn't rebalance leaders.
+
+[[auto_rebalancing_cli_conflict]]
+==== Running both at the same time
+
+Running the CLI rebalancing tool while the auto-rebalancer is enabled isn't
+recommended. Neither knows about the moves the other one has scheduled, so they
+may both try to move replicas of the same tablet, or together run more
+concurrent moves on a tablet server than either one's per-server limit allows.
+Before running `kudu cluster rebalance`, disable the auto-rebalancer on all
+masters and enable it again once the tool has finished:
+
+[source,bash]
+----
+for m in <master1> <master2> <master3>; do
+  sudo -u kudu kudu master set_flag $m auto_rebalancing_enabled false
+done
+sudo -u kudu kudu cluster rebalance <master_addresses>
+for m in <master1> <master2> <master3>; do
+  sudo -u kudu kudu master set_flag $m auto_rebalancing_enabled true
+done
+----
+
+Disabling the auto-rebalancer takes effect at the start of its next round.
+Moves it has already scheduled aren't cancelled and keep going until they
+finish.
+
+[[auto_rebalancing_prerequisites]]
+=== Prerequisites
+
+Both tasks are experimental: enabling either one requires
+`--unlock_experimental_flags` on the masters.
+
+The auto-rebalancer requires the 3-4-3 replica management scheme, that is,
+`--raft_prepare_replacement_before_eviction=true` on the masters. This is the
+default. A master started with `--auto_rebalancing_enabled=true` and
+`--raft_prepare_replacement_before_eviction=false` fails flag validation and
+doesn't start.
+
+The auto-rebalancer only makes moves when every live tablet server is
+available for placement. If one is in maintenance mode (see below), the round
+is skipped.
+
+[[auto_rebalancing_flags]]
+=== Configuration
+
+The flags below are set on the masters. Flags marked _runtime_ can be changed
+with `kudu master set_flag`; the others need a master restart to take effect.
+
+==== Auto-rebalancer
+
+`--auto_rebalancing_interval_seconds` (default: `30`)::
+How long the auto-rebalancer sleeps between rounds. A round schedules a batch
+of moves and waits for all of them to finish, so the interval is the pause
+between batches, not the length of a round. The default is fine for most
+clusters. Raise it to spread rebalancing out over a longer time.
+
+`--auto_rebalancing_max_moves_per_server` (default: `1`)::
+The most replica moves a single tablet server takes part in at once. Moving a
+replica off a server and moving one onto it count as separate moves. The limit
+holds for the whole batch of a round, across the cross-location and
+per-location rebalancing phases. Each move copies a tablet over the network
+and to disk, so keep the default on busy clusters. Raising it to 2 or 3 lets
+the cluster balance faster, for example after adding tablet servers, at the
+cost of more load on the servers involved.
+
+`--auto_rebalancing_load_imbalance_threshold` (default: `1.0`)::
+Only matters on clusters with
+link:administration.html#rack_awareness[locations] set up. If a table's replica
+load across locations is more uneven than this threshold, the auto-rebalancer
+moves replicas between locations to fix it. Lower values (down to about `0.5`)
+give a more even spread across locations, higher values mean fewer moves
+between locations. The default is a good trade-off for most clusters.
+
+`--auto_rebalancing_prefer_follower_replica_moves` (default: `true`, runtime)::
+When two candidate moves are equally good, prefer the one whose source replica
+is a follower. Moving a leader replica means leadership has to move to another
+replica as well, which briefly affects clients writing to that tablet. Keep
+the default. A leader replica is still moved when that's the only way to
+improve the balance.
+
+`--auto_rebalancing_enable_range_rebalancing` (default: `false`)::
+Balance each range partition of a table separately instead of the table as a
+whole. This helps tables whose load is concentrated in a few ranges, such as
+time-series tables where most writes go to the newest range: without it, all
+the tablets of the newest range may end up on the same few tablet servers even
+though the table as a whole looks balanced. Expect more moves when turning it
+on, since there's more to balance. Set it in the masters' flag files and
+restart the masters rather than changing it at runtime.
+
+==== Auto-leader-rebalancer
+
+`--auto_leader_rebalancing_interval_seconds` (default: `3600`, runtime)::
+How long the auto-leader-rebalancer waits between rounds. The first round runs
+as soon as a master becomes the leader, so leaders get rebalanced shortly after
+a master restart or leadership change. Leader transfers are cheap, but each
+round looks at the replica locations of every table. Lower it (for example to
+300 or 600 seconds) if leaders often become skewed, such as during frequent
+tablet server restarts.
+
+`--leader_rebalancing_max_moves_per_round` (default: `10`, runtime)::
+The most leader transfers the auto-leader-rebalancer makes in one round,
+across all tables. On a large cluster with a lot of leader skew, the default
+can take many rounds to even things out, so consider raising it together with
+lowering the interval. Keep it low if you want the leader moves to happen
+gradually.
+
+`--leader_rebalancing_ignore_soft_deleted_tables` (default: `false`, runtime)::
+Skip tables that have been soft-deleted. They don't serve any traffic, so
+there's little point in balancing their leaders. Set it to `true` if the
+cluster keeps many soft-deleted tables around.
+
+[[auto_rebalancing_algorithm]]
+=== How the auto-leader-rebalancer picks moves
+
+Each round has two passes. The per-table pass spreads each table's leaders
+evenly across the tablet servers hosting its replicas, handing leadership to
+the follower with the lowest share of that table's leaders. The
+global pass then moves leaders from tablet servers that lead the most tablets
+across all tables to ones that lead the fewest, without making any single table
+uneven again. The global pass only runs in rounds where the per-table pass had
+nothing left to do; otherwise it's postponed to a later round. Tables with a
+replication factor of 1 are skipped, since there's no other replica to hand
+leadership to.
+
+[[auto_rebalancing_maintenance_mode]]
+=== Tablet servers in maintenance mode
+
+The two tasks treat tablet servers in
+link:administration.html#minimizing_cluster_disruption_during_temporary_single_ts_downtime[maintenance mode]
+differently:
+
+* The auto-rebalancer doesn't make any moves while a live tablet server is in
+  maintenance mode. Each round is skipped until the tablet server leaves
+  maintenance mode, so replicas don't have to be moved back once it returns.
+* The auto-leader-rebalancer never moves leadership onto a tablet server in
+  maintenance mode. Such a tablet server can still give leaders away in the
+  per-table pass if it leads more than its share of a table's tablets, but the
+  global pass leaves it out entirely. Neither pass moves all leaders away from
+  it. To do that before taking a tablet server down, use
+  `kudu tserver quiesce start` as described in
+  link:administration.html#rolling_restart[Orchestrating a rolling restart].
+
+[[auto_rebalancing_metrics]]
+=== Metrics
+
+The masters expose the following metrics for the two tasks. They only change
+on the leader master.
+
+Auto-rebalancer counters:
+
+`auto_rebalancer_follower_moves_scheduled`::
+Replica moves scheduled where the source replica was a follower.
+`auto_rebalancer_leader_moves_scheduled`::
+Replica moves scheduled where the source replica was the leader, because no
+follower could be moved instead. If this grows much faster than the follower
+counter, clients are seeing more leadership changes than necessary.
+`auto_rebalancer_rounds_completed`::
+Rounds that ran to the end, including waiting for their moves to finish.
+Skipped rounds, for example while a tablet server is in maintenance mode, don't
+count. If the auto-rebalancer is enabled but this counter isn't growing, check
+the leader master's log for the reason.
+
+Auto-leader-rebalancer counters:
+
+`auto_leader_rebalancer_moves_scheduled`::
+Leader transfers attempted, across both passes. A transfer counts once its
+`LeaderStepDown` request has been sent. This counter is always the sum of the
+next two.
+`auto_leader_rebalancer_moves_completed`::
+Leader transfers accepted by the tablet server.
+`auto_leader_rebalancer_moves_failed`::
+Leader transfers that failed or were rejected by the tablet server.
+`auto_leader_rebalancer_rounds_completed`::
+Rounds that ran to the end.
+`auto_leader_rebalancer_global_pass_skipped`::
+Rounds where the global pass was postponed because the per-table pass still
+had work to do. If it grows every round for a long time, the per-table pass
+keeps finding new work (for example because of frequent leader elections) and
+the global pass never gets to run.
+`auto_leader_rebalancer_task_errors`::
+Rounds that failed with an unexpected error. This is a warning-level metric
+and the best one to alert on if the task seems stuck. Losing master leadership
+in the middle of a round doesn't count as an error.
+
+Cluster-wide gauges, which are useful whether or not the tasks are enabled:
+
+`cluster_replica_skew`::
+The difference between the number of replicas on the tablet server hosting the
+most replicas and the one hosting the fewest.
+`cluster_leader_skew`::
+The same for Raft leaders: the difference between the number of leaders on the
+tablet server leading the most tablets and the one leading the fewest. Tablet
+servers running a version that doesn't report its leader count to the master
+are left out. A value that stays high while the auto-leader-rebalancer is
+enabled suggests it can't keep up; consider lowering
+`--auto_leader_rebalancing_interval_seconds` or raising
+`--leader_rebalancing_max_moves_per_round`.
