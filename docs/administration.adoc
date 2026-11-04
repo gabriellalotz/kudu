@@ -1498,6 +1498,9 @@ Kudu admin user, specifying all master addresses:
 sudo -u kudu kudu cluster rebalance master-01.example.com,master-02.example.com,master-03.example.com
 ----
 
+NOTE: Kudu masters can also rebalance replicas and leaders automatically, see
+link:auto_rebalancing.html[Automatic Cluster Rebalancing].
+
 When run, the rebalancer will report on the initial tablet replica distribution
 in the cluster, log the replicas it moves, and print a final summary of the
 distribution when it terminates:
