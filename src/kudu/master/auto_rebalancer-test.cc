@@ -306,6 +306,12 @@ class AutoRebalancerTest : public KuduTest {
     auto_rebalancer->ExecuteMoves(moves);
   }
 
+  static Status CheckReplicaMovesCompletedForTest(
+      AutoRebalancerTask* auto_rebalancer,
+      vector<rebalance::Rebalancer::ReplicaMove>* moves) {
+    return auto_rebalancer->CheckReplicaMovesCompleted(moves);
+  }
+
   // Builds a thread-less AutoRebalancerTask wired to the same cluster as the
   // live one. moves_per_tserver_ is only ever touched by the single live
   // auto-rebalancer thread in production, so it carries no lock; driving
@@ -1733,6 +1739,95 @@ TEST_F(AutoRebalancerTest, ExecuteMovesCASRejectionDropsMoveGracefully) {
     ASSERT_STRINGS_ANY_MATCH(sink.logged_msgs(), "Failed to schedule move for tablet");
   });
   NO_PENDING_FATALS();
+}
+
+// Moving a replica off the tablet's leader should complete like any other
+// move. CheckMoveCompleted() steps the leader down along the way, and the CLI
+// ignores errors from that step-down since it's only there to speed up the
+// eviction, so a hiccup in it shouldn't make the master give up on the move.
+TEST_F(AutoRebalancerTest, LeaderReplicaMoveCompletes) {
+  flag_saver_ = make_unique<FlagSaver>();
+
+  cluster_opts_.num_tablet_servers = 4;
+  ASSERT_OK(CreateAndStartCluster(/*enable_leader_rebalance=*/false));
+  // Keep the live auto-rebalancer out of the way; the test drives the move.
+  FLAGS_auto_rebalancing_enabled = false;
+
+  CreateWorkloadTable(/*num_tablets*/1, /*num_replicas*/3);
+
+  int leader_idx;
+  ASSERT_OK(cluster_->GetLeaderMasterIndex(&leader_idx));
+  auto* master = cluster_->mini_master(leader_idx)->master();
+  auto* catalog = master->catalog_manager();
+  auto standalone = MakeStandaloneRebalancerForTest(
+      catalog, master->ts_manager(), master->metric_entity(),
+      catalog->auto_rebalancer());
+  auto* rebalancer = standalone.get();
+
+  string tablet_id;
+  string src_ts_uuid;
+  string dst_ts_uuid;
+  ASSERT_EVENTUALLY([&] {
+    rebalance::ClusterRawInfo raw_info;
+    ASSERT_OK(BuildClusterRawInfoForTest(rebalancer, nullopt, &raw_info));
+    ASSERT_EQ(1, raw_info.tablet_summaries.size());
+    const auto& tablet = raw_info.tablet_summaries[0];
+    ASSERT_EQ(kudu::cluster_summary::HealthCheckResult::HEALTHY, tablet.result);
+    tablet_id = tablet.id;
+    unordered_set<string> replica_ts_uuids;
+    src_ts_uuid.clear();
+    for (const auto& r : tablet.replicas) {
+      replica_ts_uuids.insert(r.ts_uuid);
+      if (r.is_leader) {
+        src_ts_uuid = r.ts_uuid;
+      }
+    }
+    ASSERT_FALSE(src_ts_uuid.empty());
+    dst_ts_uuid.clear();
+    for (int i = 0; i < cluster_->num_tablet_servers(); ++i) {
+      const auto& uuid = cluster_->mini_tablet_server(i)->uuid();
+      if (!ContainsKey(replica_ts_uuids, uuid)) {
+        dst_ts_uuid = uuid;
+      }
+    }
+    ASSERT_FALSE(dst_ts_uuid.empty());
+  });
+
+  rebalance::Rebalancer::ReplicaMove move;
+  move.tablet_uuid = tablet_id;
+  move.ts_uuid_from = src_ts_uuid;
+  move.ts_uuid_to = dst_ts_uuid;
+  vector<rebalance::Rebalancer::ReplicaMove> moves = { move };
+  ExecuteMovesForTest(rebalancer, &moves);
+  ASSERT_EQ(1, moves.size()) << "the move wasn't scheduled";
+
+  // Poll the way RunLoop() does. A non-OK status means the move was dropped
+  // as failed.
+  const MonoTime deadline = MonoTime::Now() + MonoDelta::FromSeconds(60);
+  while (!moves.empty() && MonoTime::Now() < deadline) {
+    SleepFor(MonoDelta::FromSeconds(FLAGS_auto_rebalancing_wait_for_replica_moves_seconds));
+    const Status s = CheckReplicaMovesCompletedForTest(rebalancer, &moves);
+    ASSERT_TRUE(s.ok()) << "move of the leader's replica was dropped as failed: "
+                        << s.ToString();
+  }
+  ASSERT_TRUE(moves.empty()) << "move didn't complete in time";
+
+  ASSERT_EVENTUALLY([&] {
+    consensus::ConsensusStatePB cstate;
+    {
+      CatalogManager::ScopedLeaderSharedLock l(catalog);
+      ASSERT_OK(l.first_failed_status());
+      ASSERT_OK(catalog->GetTabletConsensusState(tablet_id, &cstate));
+    }
+    bool dst_is_voter = false;
+    for (const auto& peer : cstate.committed_config().peers()) {
+      ASSERT_NE(src_ts_uuid, peer.permanent_uuid());
+      if (peer.permanent_uuid() == dst_ts_uuid) {
+        dst_is_voter = peer.member_type() == consensus::RaftPeerPB::VOTER;
+      }
+    }
+    ASSERT_TRUE(dst_is_voter);
+  });
 }
 
 // Regression test: GetMovesUsingRebalancingAlgo used to bound only the whole

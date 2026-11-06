@@ -1046,13 +1046,22 @@ Status AutoRebalancerTask::CheckMoveCompleted(
       // make sense to step down before that promotion, since doing so only
       // delays the process and the stepped-down leader will not be evicted
       // until the newly added replica is promoted to voter.
-      if (from_ts_uuid == cstate.leader_uuid()) {
-        // Re-read the leader host/port from the catalog for the step-down RPC.
-        string leader_uuid;
-        HostPort leader_hp;
-        RETURN_NOT_OK(GetTabletLeader(tablet_uuid, &leader_uuid, &leader_hp));
-        // Only proceed if the catalog-reported leader still matches.
-        if (leader_uuid == from_ts_uuid) {
+      //
+      // The step-down only speeds up the eviction, so like the CLI, treat it as
+      // best effort. It fails routinely while an earlier step-down is still
+      // being carried out, and giving up on the move over that would clear the
+      // replace marker of a move that is going fine.
+      if (from_ts_uuid == cstate.leader_uuid() &&
+          (to_ts_uuid_is_a_voter || to_ts_uuid.empty())) {
+        const auto step_down = [&]() -> Status {
+          // Re-read the leader host/port from the catalog for the step-down RPC.
+          string leader_uuid;
+          HostPort leader_hp;
+          RETURN_NOT_OK(GetTabletLeader(tablet_uuid, &leader_uuid, &leader_hp));
+          // Only proceed if the catalog-reported leader still matches.
+          if (leader_uuid != from_ts_uuid) {
+            return Status::OK();
+          }
           shared_ptr<TSDescriptor> desc;
           if (!ts_manager_->LookupTSByUUID(leader_uuid, &desc)) {
             return Status::NotFound("Could not find leader replica's tserver");
@@ -1070,6 +1079,13 @@ Status AutoRebalancerTask::CheckMoveCompleted(
           if (resp.has_error()) {
             return StatusFromPB(resp.error().status());
           }
+          return Status::OK();
+        };
+        const Status s = step_down();
+        if (!s.ok()) {
+          VLOG(1) << Substitute("tablet $0: leader step-down of $1 didn't go through, "
+                                "will retry on the next check: $2",
+                                tablet_uuid, from_ts_uuid, s.ToString());
         }
       }
 
