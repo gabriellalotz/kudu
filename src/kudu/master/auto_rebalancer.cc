@@ -778,13 +778,21 @@ Status AutoRebalancerTask::BuildClusterRawInfo(
         RETURN_NOT_OK(leaderlock.first_failed_status());
         // This will only return tablet replicas in the RUNNING state, and filter
         // to only retrieve voter replicas.
-        RETURN_NOT_OK(catalog_manager_->GetTabletLocations(
+        const Status s = catalog_manager_->GetTabletLocations(
             tablet_summary.id,
             ReplicaTypeFilter::VOTER_REPLICA,
             /*use_external_addr=*/false,
             &locs_pb,
             &ts_infos_dict,
-            nullopt));
+            nullopt);
+        // A tablet that's still being created or was just deleted has no
+        // locations, and there's nothing to move for it yet. Skip it rather
+        // than fail the whole round.
+        if (s.IsServiceUnavailable() || s.IsNotFound()) {
+          VLOG(1) << Substitute("skipping tablet $0: $1", tablet_summary.id, s.ToString());
+          continue;
+        }
+        RETURN_NOT_OK(s);
       }
 
       // Consensus state information is the same for all replicas of this tablet.

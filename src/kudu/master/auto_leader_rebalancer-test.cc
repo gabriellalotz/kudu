@@ -27,6 +27,7 @@
 #include <memory>
 #include <numeric>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <type_traits>
 #include <unordered_map>
@@ -38,8 +39,11 @@
 #include <gtest/gtest.h>
 
 #include "kudu/client/client.h"
+#include "kudu/client/schema.h"
 #include "kudu/consensus/consensus.pb.h"
 #include "kudu/consensus/consensus.proxy.h"// IWYU pragma: keep
+#include "kudu/consensus/raft_consensus.h"
+#include "kudu/gutil/basictypes.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/integration-tests/test_workload.h"
@@ -47,12 +51,15 @@
 #include "kudu/master/master.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/mini_master.h"
+#include "kudu/master/sys_catalog.h"
 #include "kudu/master/ts_descriptor.h"
 #include "kudu/master/ts_manager.h"
 #include "kudu/mini-cluster/internal_mini_cluster.h"
 #include "kudu/rpc/rpc_controller.h"
+#include "kudu/tablet/tablet_replica.h"
 #include "kudu/tserver/mini_tablet_server.h"
 #include "kudu/tserver/tserver_service.proxy.h" // IWYU pragma: keep
+#include "kudu/util/cow_object.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/status.h"
@@ -82,6 +89,8 @@ DECLARE_bool(auto_rebalancing_enabled);
 DECLARE_bool(leader_rebalancing_ignore_soft_deleted_tables);
 DECLARE_double(leader_failure_max_missed_heartbeat_periods);
 DECLARE_int32(heartbeat_interval_ms);
+DECLARE_int32(rpc_negotiation_inject_delay_ms);
+DECLARE_int32(tablet_bootstrap_inject_latency_ms);
 DECLARE_uint32(auto_leader_rebalancing_interval_seconds);
 DECLARE_uint32(auto_rebalancing_interval_seconds);
 DECLARE_uint32(auto_rebalancing_max_moves_per_server);
@@ -131,7 +140,50 @@ class LeaderRebalancerTest : public KuduTest {
       cluster_->Shutdown();
     }
     FLAGS_auto_leader_rebalancing_fail_moves_for_test = false;
+    FLAGS_rpc_negotiation_inject_delay_ms = 0;
+    FLAGS_tablet_bootstrap_inject_latency_ms = 0;
     KuduTest::TearDown();
+  }
+
+  // Starts creating a single-tablet RF=3 table without waiting for it, so its
+  // tablet can still be in CREATING while the test looks at it.
+  static void StartCreatingTable(const string& name, client::KuduClient* client) {
+    client::KuduSchema schema;
+    client::KuduSchemaBuilder b;
+    b.AddColumn("key")->Type(client::KuduColumnSchema::INT32)->NotNull()->PrimaryKey();
+    ASSERT_OK(b.Build(&schema));
+    unique_ptr<client::KuduTableCreator> creator(client->NewTableCreator());
+    ASSERT_OK(creator->table_name(name)
+                  .schema(&schema)
+                  .set_range_partition_columns({ "key" })
+                  .num_replicas(3)
+                  .wait(false)
+                  .Create());
+  }
+
+  // Waits for 'name' to show up in the leader master's catalog and returns
+  // its only tablet.
+  void GetOnlyTablet(const string& name, scoped_refptr<TabletInfo>* tablet) {
+    master::CatalogManager* catalog_manager =
+        cluster_->mini_master()->master()->catalog_manager();
+    ASSERT_EVENTUALLY([&] {
+      scoped_refptr<TableInfo> table;
+      {
+        CatalogManager::ScopedLeaderSharedLock l(catalog_manager);
+        ASSERT_OK(l.first_failed_status());
+        catalog_manager->GetTableInfoByName(name, &table);
+      }
+      ASSERT_NE(nullptr, table.get());
+      vector<scoped_refptr<TabletInfo>> tablets;
+      table->GetAllTablets(&tablets);
+      ASSERT_EQ(1, tablets.size());
+      *tablet = tablets[0];
+    });
+  }
+
+  static bool IsRunning(const scoped_refptr<TabletInfo>& tablet) {
+    TabletMetadataLock l(tablet.get(), LockMode::READ);
+    return l.data().is_running();
   }
 
   std::string table_name() { return workload_->table_name(); }
@@ -1412,6 +1464,137 @@ TEST_F(LeaderRebalancerTest, ZeroIntervalDoesNotSpin) {
   // or so; a loop that doesn't clamp turns over thousands of times in the same
   // window, so the bound need not be tight to catch a spin.
   ASSERT_GT(10, NumLoopIterations() - before);
+}
+
+// A tablet that isn't running yet, e.g. one of a table that's still being
+// created, has no locations to report. Both passes should skip it instead of
+// giving up on every other table for the round.
+TEST_F(LeaderRebalancerTest, NonRunningTabletDoesNotAbortRound) {
+  cluster_opts_.num_tablet_servers = 3;
+  ASSERT_OK(CreateAndStartCluster());
+  CreateWorkloadTable(/*num_tablets*/6, /*num_replicas*/3);
+
+  // The catalog moves a tablet from CREATING to RUNNING once it's reported
+  // with a leader. Holding up bootstrap keeps the new table's tablet short of
+  // that for the length of the test.
+  FLAGS_tablet_bootstrap_inject_latency_ms = 15000;
+  const string kCreatingTable = "creating_table";
+  NO_FATALS(StartCreatingTable(kCreatingTable, workload_->client().get()));
+  scoped_refptr<TabletInfo> creating_tablet;
+  NO_FATALS(GetOnlyTablet(kCreatingTable, &creating_tablet));
+  ASSERT_FALSE(IsRunning(creating_tablet));
+
+  master::AutoLeaderRebalancerTask* leader_rebalancer =
+      cluster_->mini_master()->master()->catalog_manager()->auto_leader_rebalancer();
+
+  // Run rounds until the workload table needs no more transfers, so the last
+  // round gets to the global pass too (it's skipped while the per-table pass
+  // still has work).
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(leader_rebalancer->RunLeaderRebalancer());
+    SleepFor(MonoDelta::FromMilliseconds(FLAGS_heartbeat_interval_ms));
+    if (CheckLeaderBalance().ok()) {
+      break;
+    }
+  }
+  ASSERT_OK(leader_rebalancer->RunLeaderRebalancer());
+
+  // Otherwise the rounds above didn't test anything.
+  ASSERT_FALSE(IsRunning(creating_tablet));
+}
+
+// The metric description and the docs say losing master leadership in the
+// middle of a round isn't a task error, so RunLeaderRebalancer() should return
+// OK for it wherever in the round it happens.
+TEST_F(LeaderRebalancerTest, LosingLeadershipMidRoundIsNotAnError) {
+  constexpr int kNumMasters = 3;
+  constexpr int kNumTables = 3;
+  constexpr int kNumTablets = 3;
+  cluster_opts_.num_masters = kNumMasters;
+  cluster_opts_.num_tablet_servers = 3;
+  ASSERT_OK(CreateAndStartCluster());
+
+  int leader_idx;
+  ASSERT_OK(cluster_->GetLeaderMasterIndex(&leader_idx));
+  master::Master* leader = cluster_->mini_master(leader_idx)->master();
+
+  vector<string> tablet_ids;
+  for (int i = 0; i < kNumTables; ++i) {
+    workload_.reset(new TestWorkload(cluster_.get()));
+    workload_->set_table_name(strings::Substitute("skewed$0", i));
+    workload_->set_num_tablets(kNumTablets);
+    workload_->set_num_replicas(3);
+    workload_->Setup();
+    scoped_refptr<TableInfo> table;
+    {
+      CatalogManager::ScopedLeaderSharedLock l(leader->catalog_manager());
+      ASSERT_OK(l.first_failed_status());
+      leader->catalog_manager()->GetTableInfoByName(workload_->table_name(), &table);
+    }
+    ASSERT_NE(nullptr, table.get());
+    vector<scoped_refptr<TabletInfo>> tablets;
+    table->GetAllTablets(&tablets);
+    for (const auto& t : tablets) {
+      tablet_ids.emplace_back(t->id());
+    }
+  }
+
+  // Put every leader on ts0, so every table wants transfers.
+  const string ts0_uuid = cluster_->mini_tablet_server(0)->uuid();
+  ASSERT_EVENTUALLY([&] {
+    for (const auto& tablet_id : tablet_ids) {
+      client::KuduTablet* ptr;
+      ASSERT_OK(workload_->client()->GetTablet(tablet_id, &ptr));
+      unique_ptr<client::KuduTablet> tablet(ptr);
+      string leader_uuid;
+      for (const auto* replica : tablet->replicas()) {
+        if (replica->is_leader()) {
+          leader_uuid = replica->ts().uuid();
+        }
+      }
+      ASSERT_FALSE(leader_uuid.empty());
+      if (leader_uuid != ts0_uuid) {
+        LeaderStepDownRequestPB req;
+        req.set_dest_uuid(leader_uuid);
+        req.set_tablet_id(tablet_id);
+        req.set_new_leader_uuid(ts0_uuid);
+        req.set_mode(consensus::GRACEFUL);
+        LeaderStepDownResponsePB resp;
+        RpcController rpc;
+        ignore_result(cluster_->tserver_consensus_proxy(
+            cluster_->tablet_server_index_by_uuid(leader_uuid))->LeaderStepDown(req, &resp, &rpc));
+      }
+      ASSERT_EQ(ts0_uuid, leader_uuid);
+    }
+  });
+
+  // The round's first step-down opens the rebalancer's connection to ts0,
+  // which the delay below makes slow. Leadership moves while it waits, and
+  // the tables after the first one then gather their tablets as a follower.
+  constexpr int kNegotiationDelayMs = 4000;
+  FLAGS_rpc_negotiation_inject_delay_ms = kNegotiationDelayMs;
+  master::AutoLeaderRebalancerTask* leader_rebalancer =
+      leader->catalog_manager()->auto_leader_rebalancer();
+  Status round_status;
+  std::thread round([&] { round_status = leader_rebalancer->RunLeaderRebalancer(); });
+
+  SleepFor(MonoDelta::FromSeconds(1));
+  const string new_leader_uuid =
+      cluster_->mini_master((leader_idx + 1) % kNumMasters)->permanent_uuid();
+  consensus::LeaderStepDownResponsePB resp;
+  const Status transfer_status = leader->catalog_manager()->sys_catalog()->tablet_replica()
+      ->consensus()->TransferLeadership(new_leader_uuid, &resp);
+  round.join();
+  FLAGS_rpc_negotiation_inject_delay_ms = 0;
+  ASSERT_OK(transfer_status);
+  ASSERT_FALSE(resp.has_error()) << resp.ShortDebugString();
+  ASSERT_EVENTUALLY([&] {
+    int idx;
+    ASSERT_OK(cluster_->GetLeaderMasterIndex(&idx));
+    ASSERT_NE(leader_idx, idx);
+  });
+
+  ASSERT_OK(round_status);
 }
 
 }  // namespace master
