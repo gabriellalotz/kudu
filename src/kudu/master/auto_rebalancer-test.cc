@@ -65,6 +65,7 @@
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/tserver/mini_tablet_server.h"
 #include "kudu/tserver/tablet_server.h"
+#include "kudu/util/cow_object.h"
 #include "kudu/util/logging_test_util.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
@@ -122,6 +123,7 @@ DECLARE_bool(enable_minidumps);
 DECLARE_int32(consensus_inject_latency_ms_in_notifications);
 DECLARE_int32(follower_unavailable_considered_failed_sec);
 DECLARE_int32(raft_heartbeat_interval_ms);
+DECLARE_int32(tablet_bootstrap_inject_latency_ms);
 DECLARE_int32(tablet_copy_download_file_inject_latency_ms);
 DECLARE_int32(tserver_unresponsive_timeout_ms);
 DECLARE_uint32(auto_leader_rebalancing_interval_seconds);
@@ -1767,6 +1769,67 @@ TEST_F(AutoRebalancerTest, ExecuteMovesCASRejectionDropsMoveGracefully) {
     ASSERT_STRINGS_ANY_MATCH(sink.logged_msgs(), "Failed to schedule move for tablet");
   });
   NO_PENDING_FATALS();
+}
+
+// A tablet that isn't running yet, e.g. one of a table that's still being
+// created, has no locations to report. BuildClusterRawInfo() should skip it
+// instead of failing, which skips the whole round.
+TEST_F(AutoRebalancerTest, NonRunningTabletDoesNotFailBuildClusterRawInfo) {
+  flag_saver_ = make_unique<FlagSaver>();
+  constexpr int kNumTablets = 3;
+  cluster_opts_.num_tablet_servers = 3;
+  ASSERT_OK(CreateAndStartCluster(/*enable_leader_rebalance=*/false));
+  FLAGS_auto_rebalancing_enabled = false;
+  CreateWorkloadTable(kNumTablets, /*num_replicas*/3);
+
+  // The catalog moves a tablet from CREATING to RUNNING once it's reported
+  // with a leader. Holding up bootstrap keeps the new table's tablet short of
+  // that for the length of the test.
+  FLAGS_tablet_bootstrap_inject_latency_ms = 15000;
+  KuduSchema schema;
+  KuduSchemaBuilder b;
+  b.AddColumn("key")->Type(KuduColumnSchema::INT32)->NotNull()->PrimaryKey();
+  ASSERT_OK(b.Build(&schema));
+  unique_ptr<KuduTableCreator> creator(workload_->client()->NewTableCreator());
+  ASSERT_OK(creator->table_name("creating_table")
+                .schema(&schema)
+                .set_range_partition_columns({ "key" })
+                .num_replicas(3)
+                .wait(false)
+                .Create());
+
+  int leader_idx;
+  ASSERT_OK(cluster_->GetLeaderMasterIndex(&leader_idx));
+  auto* master = cluster_->mini_master(leader_idx)->master();
+  auto* catalog = master->catalog_manager();
+  scoped_refptr<TabletInfo> creating_tablet;
+  ASSERT_EVENTUALLY([&] {
+    scoped_refptr<TableInfo> table;
+    {
+      CatalogManager::ScopedLeaderSharedLock l(catalog);
+      ASSERT_OK(l.first_failed_status());
+      catalog->GetTableInfoByName("creating_table", &table);
+    }
+    ASSERT_NE(nullptr, table.get());
+    vector<scoped_refptr<TabletInfo>> tablets;
+    table->GetAllTablets(&tablets);
+    ASSERT_EQ(1, tablets.size());
+    creating_tablet = tablets[0];
+  });
+  const auto is_running = [&] {
+    TabletMetadataLock l(creating_tablet.get(), LockMode::READ);
+    return l.data().is_running();
+  };
+  ASSERT_FALSE(is_running());
+
+  auto standalone = MakeStandaloneRebalancerForTest(
+      catalog, master->ts_manager(), master->metric_entity(), catalog->auto_rebalancer());
+  rebalance::ClusterRawInfo raw_info;
+  ASSERT_OK(BuildClusterRawInfoForTest(standalone.get(), nullopt, &raw_info));
+  ASSERT_GE(raw_info.tablet_summaries.size(), kNumTablets);
+
+  // Otherwise the call above didn't test anything.
+  ASSERT_FALSE(is_running());
 }
 
 // Regression test: GetMovesUsingRebalancingAlgo used to bound only the whole

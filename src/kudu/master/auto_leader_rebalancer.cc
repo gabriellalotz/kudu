@@ -261,13 +261,20 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalanceForTable(
       RETURN_NOT_OK(leaderlock.first_failed_status());
       // This will only return tablet replicas in the RUNNING state, and
       // filter to only retrieve voter replicas.
-      RETURN_NOT_OK(catalog_manager_->GetTabletLocations(
+      const Status s = catalog_manager_->GetTabletLocations(
           tablet->id(),
           ReplicaTypeFilter::VOTER_REPLICA,
           /*use_external_addr=*/false,
           &locs_pb,
           &ts_infos_dict,
-          nullopt));
+          nullopt);
+      // A tablet that's still being created or was just deleted has no
+      // locations. Skip it rather than give up on the whole round.
+      if (s.IsServiceUnavailable() || s.IsNotFound()) {
+        VLOG(1) << Substitute("skipping tablet $0: $1", tablet->id(), s.ToString());
+        continue;
+      }
+      RETURN_NOT_OK(s);
     }
 
     // Build a summary for each replica of the tablet.
@@ -682,13 +689,19 @@ Status AutoLeaderRebalancerTask::RunGlobalLeaderRebalance(
       {
         CatalogManager::ScopedLeaderSharedLock leaderlock(catalog_manager_);
         RETURN_NOT_OK(leaderlock.first_failed_status());
-        RETURN_NOT_OK(catalog_manager_->GetTabletLocations(
+        const Status s = catalog_manager_->GetTabletLocations(
             tablet->id(),
             ReplicaTypeFilter::VOTER_REPLICA,
             /*use_external_addr=*/false,
             &locs_pb,
             &ts_infos_dict,
-            nullopt));
+            nullopt);
+        // Same as in the per-table pass: skip tablets with no locations yet.
+        if (s.IsServiceUnavailable() || s.IsNotFound()) {
+          VLOG(1) << Substitute("skipping tablet $0: $1", tablet->id(), s.ToString());
+          continue;
+        }
+        RETURN_NOT_OK(s);
       }
 
       TabletPlacement placement;
@@ -937,6 +950,20 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalancer(bool* ran) {
     global_leader_count_by_ts_uuid[uuid] = 0;
   }
 
+  // The passes below take the leader lock per tablet, so losing leadership
+  // partway through shows up as an error from them. Like the checks above,
+  // report that as OK so it isn't counted as a task error.
+  const auto lost_leadership = [this]() {
+    CatalogManager::ScopedLeaderSharedLock l(catalog_manager_);
+    if (l.first_failed_status().ok()) {
+      return false;
+    }
+    VLOG(1) << "auto-leader-rebalancer: lost catalog-manager leadership "
+               "mid-round, skipping remainder of this round: "
+            << l.first_failed_status().ToString();
+    return true;
+  };
+
   // One transfer budget shared by all tables, so the
   // --leader_rebalancing_max_moves_per_round cap applies per round and not
   // per table.
@@ -946,10 +973,13 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalancer(bool* ran) {
     if (remaining_moves == 0) {
       break;
     }
-    RETURN_NOT_OK(RunLeaderRebalanceForTable(
+    const Status s = RunLeaderRebalanceForTable(
         table_info, tserver_uuids, exclude_dest_uuids, &global_leader_count_by_ts_uuid,
         AutoLeaderRebalancerTask::ExecuteMode::NORMAL, &per_table_moves_scheduled,
-        &remaining_moves));
+        &remaining_moves);
+    if (PREDICT_FALSE(!s.ok())) {
+      return lost_leadership() ? Status::OK() : s;
+    }
   }
   // Every table is now balanced on its own, but the cluster can still be
   // globally skewed if one tserver kept getting the ceiling allocation across
@@ -974,8 +1004,11 @@ Status AutoLeaderRebalancerTask::RunLeaderRebalancer(bool* ran) {
   // skipped in pre-flight, global_pass_skipped ticks up while moves_scheduled
   // stays flat: the two are scoped differently, not a lost move.
   if (per_table_moves_scheduled == 0) {
-    RETURN_NOT_OK(RunGlobalLeaderRebalance(
-        table_infos, tserver_uuids, exclude_dest_uuids, &global_leader_count_by_ts_uuid));
+    const Status s = RunGlobalLeaderRebalance(
+        table_infos, tserver_uuids, exclude_dest_uuids, &global_leader_count_by_ts_uuid);
+    if (PREDICT_FALSE(!s.ok())) {
+      return lost_leadership() ? Status::OK() : s;
+    }
   } else {
     global_pass_skipped_->Increment();
   }
