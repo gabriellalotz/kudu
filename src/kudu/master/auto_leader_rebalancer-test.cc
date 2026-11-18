@@ -304,23 +304,41 @@ class LeaderRebalancerTest : public KuduTest {
   // and forces every leader onto ts0, so all leaders pile up on a single
   // tserver. Each single-tablet table is balanced on its own (one leader equals
   // the per-table target), so only the global pass can fix the cross-table skew.
-  // Appends the created table names to 'table_names'.
+  // Appends the created table names to 'table_names' and returns once every
+  // leader is on ts0.
   void CreateSingleTabletTablesOnTs0(int num_tables,
                                      const string& table_prefix,
                                      vector<string>* table_names) {
     const int num_tservers = cluster_->num_tablet_servers();
+    vector<int32_t> leader_distribution(num_tservers, 0);
+    leader_distribution[0] = 1;
+    vector<string> new_tables;
     for (int i = 0; i < num_tables; i++) {
       const string name = strings::Substitute("$0$1", table_prefix, i);
-      table_names->emplace_back(name);
+      new_tables.emplace_back(name);
       workload_.reset(new TestWorkload(cluster_.get()));
       workload_->set_table_name(name);
       workload_->set_num_tablets(1);
       workload_->set_num_replicas(3);
       workload_->Setup();
-      vector<int32_t> leader_distribution(num_tservers, 0);
-      leader_distribution[0] = 1;
-      ASSERT_OK(MakeLeaderDistribution(leader_distribution, name));
     }
+
+    // A graceful transfer gives up quietly if ts0 doesn't catch up within one
+    // election timeout, which can happen under TSAN. A spurious election can
+    // also move a leader off ts0 afterwards. So keep asking until all the
+    // leaders are there. Asking again is harmless: tablets already led by ts0
+    // are skipped, and a request that hits a busy or stale leader is refused.
+    const string ts0_uuid = cluster_->mini_tablet_server(0)->uuid();
+    AssertEventually([&] {
+      for (const auto& name : new_tables) {
+        ASSERT_OK(MakeLeaderDistribution(leader_distribution, name));
+      }
+      std::map<string, int32_t> totals;
+      ASSERT_OK(GlobalLeaderDistribution(new_tables, &totals));
+      ASSERT_EQ(num_tables, totals.at(ts0_uuid));
+    }, MonoDelta::FromSeconds(kLeaderBalanceTimeoutSeconds));
+    NO_PENDING_FATALS();
+    table_names->insert(table_names->end(), new_tables.begin(), new_tables.end());
   }
 
   // Number of leader transfers the last rebalancer round scheduled.
@@ -403,16 +421,7 @@ class LeaderRebalancerTest : public KuduTest {
     vector<string> table_names;
     NO_FATALS(CreateSingleTabletTablesOnTs0(num_tables, table_prefix, &table_names));
 
-    const string ts0_uuid = cluster_->mini_tablet_server(0)->uuid();
     using LeaderMap = std::map<string, int32_t>;
-
-    // Wait for the forced leader moves to settle: every leader should be on ts0.
-    ASSERT_EVENTUALLY([&] {
-      LeaderMap totals;
-      ASSERT_OK(GlobalLeaderDistribution(table_names, &totals));
-      ASSERT_EQ(num_tables, totals.at(ts0_uuid));
-    });
-
     master::Master* master = cluster_->mini_master()->master();
     master::AutoLeaderRebalancerTask* leader_rebalancer =
         master->catalog_manager()->auto_leader_rebalancer();
